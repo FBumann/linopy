@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import shutil
 import time
+import warnings
 from collections.abc import Iterable
 from io import BufferedWriter, TextIOWrapper
 from pathlib import Path
@@ -1293,26 +1294,35 @@ def to_netcdf(m: Model, *args: Any, compression: dict = None, **kwargs: Any) -> 
 
     # Apply compression settings if provided
     if compression is not None:
-        encoding = {}
+        import importlib.util
 
-        # Apply compression to variables that can be compressed
-        for var_name, var in ds.data_vars.items():
-            # Skip compression for string types and sign variables
-            if var.dtype.kind in ["S", "U", "O"]:  # String and object types
-                continue
-
-            encoding[var_name] = compression.copy()
-
-        # Merge with existing encoding if provided
-        if "encoding" in kwargs:
-            for var, enc in kwargs["encoding"].items():
-                if var in encoding:
-                    encoding[var].update(enc)
-                else:
-                    encoding[var] = enc
-            kwargs["encoding"] = encoding
+        if importlib.util.find_spec("netCDF4") is None:
+            warnings.warn(
+                "Encoding is only supported with netCDF4. Install netcdf4 via pip install netcdf4."
+                "Model was exported without compression",
+                stacklevel=1,
+            )
         else:
-            kwargs["encoding"] = encoding
+            encoding = {}
+
+            # Apply compression to variables that can be compressed
+            for var_name, var in ds.data_vars.items():
+                # Skip compression for string types and sign variables
+                if var.dtype.kind in ["S", "U", "O"]:  # String and object types
+                    continue
+
+                encoding[var_name] = compression.copy()
+
+            # Merge with existing encoding if provided
+            if "encoding" in kwargs:
+                for var, enc in kwargs["encoding"].items():
+                    if var in encoding:
+                        encoding[var].update(enc)
+                    else:
+                        encoding[var] = enc
+                kwargs["encoding"] = encoding
+            else:
+                kwargs["encoding"] = encoding
 
     ds.to_netcdf(*args, **kwargs)
 
