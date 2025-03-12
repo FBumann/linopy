@@ -75,6 +75,16 @@ def test_model_to_netcdf(model: Model, tmp_path: Path) -> None:
     assert_model_equal(m, p)
 
 
+def test_compressed_model_to_netcdf(model: Model, tmp_path: Path) -> None:
+    pytest.importorskip("netCDF4")
+    m = model
+    fn = tmp_path / "test.nc"
+    m.to_netcdf(fn, compression={"zlib": True, "complevel": 5})
+    p = read_netcdf(fn)
+
+    assert_model_equal(m, p)
+
+
 def test_model_to_netcdf_with_sense(model: Model, tmp_path: Path) -> None:
     m = model
     m.objective.sense = "max"
@@ -158,7 +168,7 @@ def test_to_file_lp_None(model: Model) -> None:
 
 @pytest.mark.skipif(
     not {"gurobi", "highs"}.issubset(available_solvers),
-    reason="Gurobipy of highspy not installed",
+    reason="Gurobipy or highspy not installed",
 )
 def test_to_file_mps(model: Model, tmp_path: Path) -> None:
     import gurobipy

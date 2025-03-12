@@ -1236,9 +1236,9 @@ def non_bool_dict(
     return {k: int(v) if isinstance(v, bool) else v for k, v in d.items()}
 
 
-def to_netcdf(m: Model, *args: Any, **kwargs: Any) -> None:
+def to_netcdf(m: Model, *args: Any, compression: dict = None, **kwargs: Any) -> None:
     """
-    Write out the model to a netcdf file.
+    Write out the model to a netcdf file with optional compression.
 
     Parameters
     ----------
@@ -1246,6 +1246,10 @@ def to_netcdf(m: Model, *args: Any, **kwargs: Any) -> None:
         Model to write out.
     *args
         Arguments passed to ``xarray.Dataset.to_netcdf``.
+    compression : dict, optional
+        Compression settings to apply. Can be:
+        - A dictionary with 'zlib', 'complevel', etc. to apply to all compatible variables
+        - None (default): No compression is applied
     **kwargs : TYPE
         Keyword arguments passed to ``xarray.Dataset.to_netcdf``.
     """
@@ -1286,6 +1290,29 @@ def to_netcdf(m: Model, *args: Any, **kwargs: Any) -> None:
 
     for k in ds:
         ds[k].attrs = non_bool_dict(ds[k].attrs)
+
+    # Apply compression settings if provided
+    if compression is not None:
+        encoding = {}
+
+        # Apply compression to variables that can be compressed
+        for var_name, var in ds.data_vars.items():
+            # Skip compression for string types and sign variables
+            if var.dtype.kind in ["S", "U", "O"]:  # String and object types
+                continue
+
+            encoding[var_name] = compression.copy()
+
+        # Merge with existing encoding if provided
+        if "encoding" in kwargs:
+            for var, enc in kwargs["encoding"].items():
+                if var in encoding:
+                    encoding[var].update(enc)
+                else:
+                    encoding[var] = enc
+            kwargs["encoding"] = encoding
+        else:
+            kwargs["encoding"] = encoding
 
     ds.to_netcdf(*args, **kwargs)
 
