@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import product, zip_longest
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
 )
 from warnings import warn
 
@@ -25,7 +24,6 @@ import polars as pl
 import scipy
 import xarray as xr
 import xarray.core.groupby
-import xarray.core.rolling
 from numpy import array, nan, ndarray
 from pandas.core.frame import DataFrame
 from pandas.core.series import Series
@@ -33,11 +31,19 @@ from scipy.sparse import csc_matrix
 from xarray import Coordinates, DataArray, Dataset, IndexVariable
 from xarray.core.coordinates import DataArrayCoordinates, DatasetCoordinates
 from xarray.core.indexes import Indexes
-from xarray.core.rolling import DatasetRolling
 from xarray.core.utils import Frozen
+
+try:
+    # resolve breaking change in xarray 2025.03.0
+    import xarray.computation.rolling
+    from xarray.computation.rolling import DatasetRolling
+except ImportError:
+    import xarray.core.rolling
+    from xarray.core.rolling import DatasetRolling  # type: ignore
 
 from linopy import constraints, variables
 from linopy.common import (
+    EmptyDeprecationWrapper,
     LocIndexer,
     as_dataarray,
     assign_multiindex_safe,
@@ -307,7 +313,7 @@ class LinearExpressionRolling:
             .rename({TERM_DIM: STACKED_TERM_DIM})
             .stack({TERM_DIM: [STACKED_TERM_DIM, "_rolling_term"]}, create_index=False)
         )
-        ds["const"] = data.const.sum("_rolling_term")
+        ds = assign_multiindex_safe(ds, const=data.const.sum("_rolling_term"))
         return LinearExpression(ds, self.model)
 
 
@@ -558,12 +564,8 @@ class LinearExpression:
         # multiplication: (v1 + c1) * (v2 + c2) = v1 * v2 + c1 * v2 + c2 * v1 + c1 * c2
         # with v being the variables and c the constants
         # merge on factor dimension only returns v1 * v2 + c1 * c2
-        ds = (
-            other.data[["coeffs", "vars"]]
-            .sel(_term=0)
-            .broadcast_like(self.data)
-            .assign(const=other.const)
-        )
+        ds = other.data[["coeffs", "vars"]].sel(_term=0).broadcast_like(self.data)
+        ds = assign_multiindex_safe(ds, const=other.const)
         res = merge([self, ds], dim=FACTOR_DIM, cls=QuadraticExpression)
         # deal with cross terms c1 * v2 + c2 * v1
         if self.has_constant:
@@ -777,7 +779,7 @@ class LinearExpression:
 
     @vars.setter
     def vars(self, value: DataArray) -> None:
-        self.data["vars"] = value
+        self._data = assign_multiindex_safe(self.data, vars=value)
 
     @property
     def coeffs(self) -> DataArray:
@@ -785,7 +787,7 @@ class LinearExpression:
 
     @coeffs.setter
     def coeffs(self, value: DataArray) -> None:
-        self.data["coeffs"] = value
+        self._data = assign_multiindex_safe(self.data, coeffs=value)
 
     @property
     def const(self) -> DataArray:
@@ -793,7 +795,7 @@ class LinearExpression:
 
     @const.setter
     def const(self, value: DataArray) -> None:
-        self.data["const"] = value
+        self._data = assign_multiindex_safe(self.data, const=value)
 
     @property
     def has_constant(self) -> DataArray:
@@ -1109,7 +1111,7 @@ class LinearExpression:
         vars = self.data.vars.expand_dims(FACTOR_DIM)
         fill_value = self._fill_value["vars"]
         vars = xr.concat([vars, xr.full_like(vars, fill_value)], dim=FACTOR_DIM)
-        data = self.data.assign(vars=vars)
+        data = assign_multiindex_safe(self.data, vars=vars)
         return QuadraticExpression(data, self.model)
 
     def to_constraint(
@@ -1348,11 +1350,16 @@ class LinearExpression:
         """
         return self.vars.size
 
-    def empty(self) -> bool:
+    @property
+    def empty(self) -> EmptyDeprecationWrapper:
         """
         Get whether the linear expression is empty.
+
+        .. versionchanged:: 0.5.1
+           Returns a EmptyDeprecationWrapper which behaves like a bool and emits
+           a DeprecationWarning when called.
         """
-        return self.shape == (0,)
+        return EmptyDeprecationWrapper(not self.size)
 
     def densify_terms(self) -> LinearExpression:
         """
@@ -1447,7 +1454,7 @@ class LinearExpression:
         return df
 
     # Wrapped function which would convert variable to dataarray
-    assign = exprwrap(Dataset.assign)
+    assign = exprwrap(assign_multiindex_safe)
 
     assign_multiindex_safe = exprwrap(assign_multiindex_safe)
 

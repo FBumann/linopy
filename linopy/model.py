@@ -9,10 +9,10 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from tempfile import NamedTemporaryFile, gettempdir
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,7 @@ from xarray.core.types import T_Chunks
 from linopy import solvers
 from linopy.common import (
     as_dataarray,
+    assign_multiindex_safe,
     best_int,
     maybe_replace_signs,
     replace_by_map,
@@ -705,7 +706,7 @@ class Model:
             The objective function assigned to the model.
         """
         if not overwrite:
-            assert self.objective.expression.empty(), (
+            assert self.objective.expression.empty, (
                 "Objective already defined."
                 " Set `overwrite` to True to force overwriting."
             )
@@ -734,7 +735,9 @@ class Model:
         for k in list(self.constraints):
             vars = self.constraints[k].data["vars"]
             vars = vars.where(~vars.isin(labels), -1)
-            self.constraints[k].data["vars"] = vars
+            self.constraints[k]._data = assign_multiindex_safe(
+                self.constraints[k].data, vars=vars
+            )
 
         self.objective = self.objective.sel(
             {TERM_DIM: ~self.objective.vars.isin(labels)}

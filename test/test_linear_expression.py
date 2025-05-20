@@ -199,6 +199,9 @@ def test_linear_expression_with_multiplication(x: Variable) -> None:
     expr = np.array([1, 2]) * x
     assert isinstance(expr, LinearExpression)
 
+    expr = np.array(1) * x
+    assert isinstance(expr, LinearExpression)
+
     expr = xr.DataArray(np.array([[1, 2], [2, 3]])) * x
     assert isinstance(expr, LinearExpression)
 
@@ -537,6 +540,15 @@ def test_linear_expression_getitem_list(x: Variable, y: Variable, z: Variable) -
 def test_linear_expression_loc(x: Variable, y: Variable) -> None:
     expr = x + y
     assert expr.loc[0].size < expr.loc[:5].size
+
+
+def test_linear_expression_empty(v: Variable) -> None:
+    expr = 7 * v
+    assert not expr.empty
+    assert expr.loc[[]].empty
+
+    with pytest.warns(DeprecationWarning, match="use `.empty` property instead"):
+        assert expr.loc[[]].empty()
 
 
 def test_linear_expression_isnull(v: Variable) -> None:

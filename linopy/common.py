@@ -10,7 +10,7 @@ from __future__ import annotations
 import operator
 import os
 from collections.abc import Generator, Hashable, Iterable, Sequence
-from functools import reduce, wraps
+from functools import partial, reduce, wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar, overload
 from warnings import warn
@@ -19,8 +19,10 @@ import numpy as np
 import pandas as pd
 import polars as pl
 from numpy import arange, signedinteger
-from xarray import DataArray, Dataset, align, apply_ufunc, broadcast
-from xarray.core import indexing
+from xarray import DataArray, Dataset, apply_ufunc, broadcast
+from xarray import align as xr_align
+from xarray.core import dtypes, indexing
+from xarray.core.types import JoinOptions, T_Alignable
 from xarray.namedarray.utils import is_dict_like
 
 from linopy.config import options
@@ -203,6 +205,10 @@ def numpy_to_dataarray(
         DataArray:
             The converted DataArray.
     """
+    # fallback case for zero dim arrays
+    if arr.ndim == 0:
+        return DataArray(arr.item(), coords=coords, dims=dims, **kwargs)
+
     ndim = max(arr.ndim, 0 if coords is None else len(coords))
     if isinstance(dims, (Iterable, Sequence)):
         dims = list(dims)
@@ -426,13 +432,13 @@ def save_join(*dataarrays: DataArray, integer_dtype: bool = False) -> Dataset:
     Join multiple xarray Dataarray's to a Dataset and warn if coordinates are not equal.
     """
     try:
-        arrs = align(*dataarrays, join="exact")
+        arrs = xr_align(*dataarrays, join="exact")
     except ValueError:
         warn(
             "Coordinates across variables not equal. Perform outer join.",
             UserWarning,
         )
-        arrs = align(*dataarrays, join="outer")
+        arrs = xr_align(*dataarrays, join="outer")
         if integer_dtype:
             arrs = tuple([ds.fillna(-1).astype(int) for ds in arrs])
     return Dataset({ds.name: ds for ds in arrs})
@@ -987,6 +993,103 @@ def check_common_keys_values(list_of_dicts: list[dict[str, Any]]) -> bool:
     return all(len({d[k] for d in list_of_dicts if k in d}) == 1 for k in common_keys)
 
 
+def align(
+    *objects: LinearExpression | Variable | T_Alignable,
+    join: JoinOptions = "inner",
+    copy: bool = True,
+    indexes: Any = None,
+    exclude: str | Iterable[Hashable] = frozenset(),
+    fill_value: Any = dtypes.NA,
+) -> tuple[LinearExpression | Variable | T_Alignable, ...]:
+    """
+    Given any number of Variables, Expressions, Dataset and/or DataArray objects,
+    returns new objects with aligned indexes and dimension sizes.
+
+    Array from the aligned objects are suitable as input to mathematical
+    operators, because along each dimension they have the same index and size.
+
+    Missing values (if ``join != 'inner'``) are filled with ``fill_value``.
+    The default fill value is NaN.
+
+    This functions essentially wraps the xarray function
+    :py:func:`xarray.align`.
+
+    Parameters
+    ----------
+    *objects : Variable, LinearExpression, Dataset or DataArray
+        Objects to align.
+    join : {"outer", "inner", "left", "right", "exact", "override"}, optional
+        Method for joining the indexes of the passed objects along each
+        dimension:
+
+        - "outer": use the union of object indexes
+        - "inner": use the intersection of object indexes
+        - "left": use indexes from the first object with each dimension
+        - "right": use indexes from the last object with each dimension
+        - "exact": instead of aligning, raise `ValueError` when indexes to be
+        aligned are not equal
+        - "override": if indexes are of same size, rewrite indexes to be
+        those of the first object with that dimension. Indexes for the same
+        dimension must have the same size in all objects.
+
+    copy : bool, default: True
+        If ``copy=True``, data in the return values is always copied. If
+        ``copy=False`` and reindexing is unnecessary, or can be performed with
+        only slice operations, then the output may share memory with the input.
+        In either case, new xarray objects are always returned.
+    indexes : dict-like, optional
+        Any indexes explicitly provided with the `indexes` argument should be
+        used in preference to the aligned indexes.
+    exclude : str, iterable of hashable or None, optional
+        Dimensions that must be excluded from alignment
+    fill_value : scalar or dict-like, optional
+        Value to use for newly missing values. If a dict-like, maps
+        variable names to fill values. Use a data array's name to
+        refer to its values.
+
+    Returns
+    -------
+    aligned : tuple of DataArray or Dataset
+        Tuple of objects with the same type as `*objects` with aligned
+        coordinates.
+
+
+    """
+    from linopy.expressions import LinearExpression
+    from linopy.variables import Variable
+
+    finisher: list[partial[Any] | Callable[[Any], Any]] = []
+    das: list[Any] = []
+    for obj in objects:
+        if isinstance(obj, LinearExpression):
+            finisher.append(partial(obj.__class__, model=obj.model))
+            das.append(obj.data)
+        elif isinstance(obj, Variable):
+            finisher.append(
+                partial(
+                    obj.__class__,
+                    model=obj.model,
+                    name=obj.data.attrs["name"],
+                    skip_broadcast=True,
+                )
+            )
+            das.append(obj.data)
+        else:
+            finisher.append(lambda x: x)
+            das.append(obj)
+
+    exclude = frozenset(exclude).union(HELPER_DIMS)
+    aligned = xr_align(
+        *das,
+        join=join,
+        copy=copy,
+        indexes=indexes,
+        exclude=exclude,
+        fill_value=fill_value,
+    )
+    return tuple([f(da) for f, da in zip(finisher, aligned)])
+
+
 LocT = TypeVar("LocT", "Dataset", "Variable", "LinearExpression", "Constraint")
 
 
@@ -1005,3 +1108,34 @@ class LocIndexer(Generic[LocT]):
             labels = indexing.expanded_indexer(key, self.object.ndim)
             key = dict(zip(self.object.dims, labels))
         return self.object.sel(key)
+
+
+class EmptyDeprecationWrapper:
+    """
+    Temporary wrapper for a smooth transition from .empty() to .empty
+
+    Use `bool(expr.empty)` to explicitly unwrap.
+
+    See Also
+    --------
+    https://github.com/PyPSA/linopy/pull/425
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: bool):
+        self.value = value
+
+    def __bool__(self) -> bool:
+        return self.value
+
+    def __repr__(self) -> str:
+        return repr(self.value)
+
+    def __call__(self) -> bool:
+        warn(
+            "Calling `.empty()` is deprecated, use `.empty` property instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.value
