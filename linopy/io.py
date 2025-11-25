@@ -867,6 +867,12 @@ def to_highspy(m: Model, explicit_coordinate_names: bool = False) -> Highs:
     """
     import highspy
 
+    if m.has_quadratic_constraints:
+        raise ValueError(
+            "HiGHS does not support quadratic constraints. "
+            "Use a solver that supports QCP: gurobi, cplex, mosek, xpress, copt, scip."
+        )
+
     print_variable, print_constraint = get_printers_scalar(
         m, explicit_coordinate_names=explicit_coordinate_names
     )
