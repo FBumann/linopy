@@ -521,6 +521,45 @@ class TestNetCDFSerialization:
         fn.unlink()
 
 
+class TestMOSEKExport:
+    """Tests for MOSEK direct API export with quadratic constraints."""
+
+    def test_to_mosek_with_quadratic_constraints(
+        self, m: Model, x: linopy.Variable, y: linopy.Variable
+    ) -> None:
+        """Test that to_mosek works with quadratic constraints."""
+        if "mosek" not in linopy.available_solvers:
+            pytest.skip("MOSEK not available")
+
+        m.add_constraints(x + y <= 8, name="budget")
+        m.add_quadratic_constraints(x * x + y * y, "<=", 25, name="circle")
+        m.add_objective(x + 2 * y, sense="max")
+
+        from linopy.io import to_mosek
+
+        task = to_mosek(m)
+        # If we got here without error, the export worked
+        assert task is not None
+
+    def test_to_mosek_multidimensional(self) -> None:
+        """Test MOSEK export with multi-dimensional quadratic constraints."""
+        if "mosek" not in linopy.available_solvers:
+            pytest.skip("MOSEK not available")
+
+        m = Model()
+        x = m.add_variables(lower=0, coords=[range(3)], name="x")
+        y = m.add_variables(lower=0, coords=[range(3)], name="y")
+
+        m.add_constraints(x + y <= 8, name="budget")
+        m.add_quadratic_constraints(x * x + y * y, "<=", 25, name="circles")
+        m.add_objective((x + 2 * y).sum(), sense="max")
+
+        from linopy.io import to_mosek
+
+        task = to_mosek(m)
+        assert task is not None
+
+
 class TestDualValues:
     """Tests for dual value retrieval for quadratic constraints."""
 
