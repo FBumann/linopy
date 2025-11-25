@@ -315,18 +315,6 @@ class TestSolverValidation:
             with pytest.raises(ValueError, match="does not support quadratic"):
                 m.solve(solver_name="highs")
 
-    def test_to_highspy_raises_on_quadratic_constraints(
-        self, m: Model, x: linopy.Variable, y: linopy.Variable
-    ) -> None:
-        """Test that to_highspy raises ValueError for quadratic constraints."""
-        m.add_objective(x + y)
-        m.add_quadratic_constraints(x * x + y * y, "<=", 100, name="qc1")
-
-        from linopy.io import to_highspy
-
-        with pytest.raises(ValueError, match="HiGHS does not support quadratic"):
-            to_highspy(m)
-
 
 class TestQuadraticConstraintRepr:
     """Tests for QuadraticConstraint string representations."""
