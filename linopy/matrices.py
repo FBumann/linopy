@@ -263,7 +263,7 @@ class MatrixAccessor:
 
             if label_df.empty:
                 # No quadratic terms - empty matrix
-                matrices.append(scipy.sparse.csc_matrix((n_vars, n_vars)))
+                matrices.append(csc_matrix((n_vars, n_vars)))
                 continue
 
             rows = []
@@ -296,7 +296,7 @@ class MatrixAccessor:
                     cols.extend([j, i])
                     data.extend([coeff, coeff])
 
-            Q = scipy.sparse.csc_matrix(
+            Q = csc_matrix(
                 (data, (rows, cols)), shape=(n_vars, n_vars)
             )
             matrices.append(Q)
@@ -321,7 +321,7 @@ class MatrixAccessor:
         n_vars = len(self.vlabels)
 
         if n_cons == 0 or n_vars == 0:
-            return scipy.sparse.csc_matrix((n_cons, n_vars))
+            return csc_matrix((n_cons, n_vars))
 
         # Build variable label to index mapping
         var_map = pd.Series(index=self.vlabels, data=np.arange(n_vars))
@@ -333,7 +333,7 @@ class MatrixAccessor:
         linear_df = df[~df["is_quadratic"] & (df["vars"] >= 0)]
 
         if linear_df.empty:
-            return scipy.sparse.csc_matrix((n_cons, n_vars))
+            return csc_matrix((n_cons, n_vars))
 
         rows = []
         cols = []
@@ -348,6 +348,6 @@ class MatrixAccessor:
                 cols.append(var_idx)
                 data.append(row["coeffs"])
 
-        return scipy.sparse.csc_matrix(
+        return csc_matrix(
             (data, (rows, cols)), shape=(n_cons, n_vars)
         )
