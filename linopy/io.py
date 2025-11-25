@@ -459,15 +459,22 @@ def quadratic_constraints_to_file(
         if df.height == 0:
             continue
 
-        # Get constraint metadata
-        sign = str(qcon.sign.values)
-        rhs = float(qcon.rhs.values)
+        # Build label -> (sign, rhs) lookup for multi-dimensional constraints
+        labels_flat = qcon.labels.values.ravel()
+        signs_flat = np.broadcast_to(qcon.sign.values, qcon.labels.shape).ravel()
+        rhs_flat = np.broadcast_to(qcon.rhs.values, qcon.labels.shape).ravel()
+        label_metadata = {
+            int(lab): (str(signs_flat[i]), float(rhs_flat[i]))
+            for i, lab in enumerate(labels_flat)
+            if lab != -1
+        }
 
         # Get unique labels (constraint indices)
         labels = df["labels"].unique().to_list()
 
         for label in labels:
             label_df = df.filter(pl.col("labels") == label)
+            sign, rhs = label_metadata[int(label)]
 
             # Start constraint line with label
             constraint_name = clean_name(name)
@@ -796,6 +803,16 @@ def to_gurobipy(
             qcon = m.quadratic_constraints[name]
             df = qcon.to_polars()
 
+            # Build label -> (sign, rhs) lookup for multi-dimensional constraints
+            labels_flat = qcon.labels.values.ravel()
+            signs_flat = np.broadcast_to(qcon.sign.values, qcon.labels.shape).ravel()
+            rhs_flat = np.broadcast_to(qcon.rhs.values, qcon.labels.shape).ravel()
+            label_metadata = {
+                int(lab): (str(signs_flat[i]), float(rhs_flat[i]))
+                for i, lab in enumerate(labels_flat)
+                if lab != -1
+            }
+
             # Build QuadExpr for each constraint label
             for label in df["labels"].unique().to_list():
                 label_df = df.filter(pl.col("labels") == label)
@@ -819,9 +836,8 @@ def to_gurobipy(
                     var2 = int(row["vars2"])
                     qexpr.addTerms(coeff, x[var1].item(), x[var2].item())
 
-                # Get sign and rhs
-                sign = str(qcon.sign.values)
-                rhs = float(qcon.rhs.values)
+                # Get sign and rhs for this specific label
+                sign, rhs = label_metadata[int(label)]
 
                 # Map sign to gurobipy sense
                 if sign == "<=":
