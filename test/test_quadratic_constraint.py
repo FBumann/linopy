@@ -469,6 +469,7 @@ class TestMatrixAccessor:
         assert m.matrices.qc_linear is None
 
 
+
 class TestNetCDFSerialization:
     """Tests for netCDF serialization of quadratic constraints."""
 
