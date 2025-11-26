@@ -307,12 +307,12 @@ class TestLPFileExport:
         # Clean up
         fn.unlink()
 
-    def test_mps_export_rejects_quadratic_constraints(
+    def test_mps_export_with_quadratic_constraints(
         self, m: Model, x: linopy.Variable, y: linopy.Variable
     ) -> None:
-        """Test that MPS export raises an error for quadratic constraints."""
-        if "highs" not in linopy.available_solvers:
-            pytest.skip("HiGHS not available for MPS export")
+        """Test that MPS export works with quadratic constraints (using Gurobi)."""
+        if "gurobi" not in linopy.available_solvers:
+            pytest.skip("Gurobi not available for MPS export with QC")
 
         m.add_objective(x + y)
         m.add_quadratic_constraints(x * x + y * y, "<=", 100, name="qc1")
@@ -320,8 +320,12 @@ class TestLPFileExport:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".mps", delete=False) as f:
             fn = Path(f.name)
 
-        with pytest.raises(ValueError, match="MPS export does not support quadratic"):
-            m.to_file(fn, progress=False)
+        m.to_file(fn, progress=False)
+        content = fn.read_text()
+
+        # Check that QCMATRIX section is present
+        assert "QCMATRIX" in content
+        assert "qc" in content.lower()
 
         fn.unlink(missing_ok=True)
 
