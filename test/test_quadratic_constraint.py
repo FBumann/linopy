@@ -307,6 +307,24 @@ class TestLPFileExport:
         # Clean up
         fn.unlink()
 
+    def test_mps_export_rejects_quadratic_constraints(
+        self, m: Model, x: linopy.Variable, y: linopy.Variable
+    ) -> None:
+        """Test that MPS export raises an error for quadratic constraints."""
+        if "highs" not in linopy.available_solvers:
+            pytest.skip("HiGHS not available for MPS export")
+
+        m.add_objective(x + y)
+        m.add_quadratic_constraints(x * x + y * y, "<=", 100, name="qc1")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".mps", delete=False) as f:
+            fn = Path(f.name)
+
+        with pytest.raises(ValueError, match="MPS export does not support quadratic"):
+            m.to_file(fn, progress=False)
+
+        fn.unlink(missing_ok=True)
+
 
 class TestSolverValidation:
     """Tests for solver validation with quadratic constraints."""

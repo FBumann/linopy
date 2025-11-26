@@ -634,7 +634,13 @@ def to_file(
     elif io_api == "mps":
         if "highs" not in solvers.available_solvers:
             raise RuntimeError(
-                "Package highspy not installed. This is required to exporting to MPS file."
+                "Package highspy not installed. This is required for exporting to MPS file."
+            )
+
+        if m.has_quadratic_constraints:
+            raise ValueError(
+                "MPS export does not support quadratic constraints. "
+                "Use LP format instead: model.to_file('model.lp')"
             )
 
         # Use very fast highspy implementation
