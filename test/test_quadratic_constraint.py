@@ -721,7 +721,9 @@ def qc_cross_terms_model() -> Model:
     """
     Model with cross product constraint: xy <= 4.
     max x + y s.t. xy <= 4, x,y >= 0, x <= 4, y <= 4
-    At optimum, xy = 4. With objective x+y, solution is x=y=2, obj=4.
+
+    This is a NONCONVEX bilinear constraint. The optimal solutions are
+    corners like (4, 1) or (1, 4) with objective value 5 and xy = 4.
     """
     m = Model()
     x = m.add_variables(lower=0, upper=4, name="x")
@@ -736,8 +738,9 @@ def qc_geq_model() -> Model:
     """
     Greater-than quadratic constraint: x² + y² >= 4.
     min x + y s.t. x² + y² >= 4, x,y >= 0
-    Solution is on the circle where gradient of objective equals constraint gradient.
-    x = y = √2, obj = 2√2 ≈ 2.828
+
+    This is NONCONVEX. The optimal solution is at an extreme point on
+    the constraint boundary: either x=0,y=2 or x=2,y=0, giving obj=2.
     """
     m = Model()
     x = m.add_variables(lower=0, name="x")
@@ -824,44 +827,59 @@ class TestQuadraticConstraintSolving:
     def test_qc_cross_terms(
         self, qc_cross_terms_model: Model, solver: str, io_api: str
     ) -> None:
-        """Test QC with cross product terms (xy)."""
+        """Test QC with cross product terms (xy) - nonconvex bilinear."""
+        # MOSEK does not support nonconvex problems
+        if solver == "mosek":
+            pytest.skip("MOSEK does not support nonconvex bilinear constraints")
+
         status, condition = qc_cross_terms_model.solve(solver, io_api=io_api)
         assert status == "ok"
         assert condition == "optimal"
 
-        # max x+y s.t. xy <= 4, with bounds, solution is x=y=2
+        # Nonconvex - verify constraint satisfaction rather than exact values
+        # Optimal is x+y = 5 with xy = 4 (e.g., x=4,y=1 or x=1,y=4)
         x_val = float(qc_cross_terms_model.solution["x"].values)
         y_val = float(qc_cross_terms_model.solution["y"].values)
         obj_val = qc_cross_terms_model.objective.value
 
-        assert np.isclose(x_val, 2.0, atol=0.01)
-        assert np.isclose(y_val, 2.0, atol=0.01)
-        assert np.isclose(obj_val, 4.0, atol=0.01)
+        # Verify constraint is satisfied
+        assert x_val * y_val <= 4.0 + 0.01
+        # Verify optimal objective value
+        assert np.isclose(obj_val, 5.0, atol=0.01)
 
     @pytest.mark.parametrize("solver,io_api", qc_solver_params)
     def test_qc_geq_constraint(
         self, qc_geq_model: Model, solver: str, io_api: str
     ) -> None:
-        """Test >= quadratic constraint."""
+        """Test >= quadratic constraint - nonconvex."""
+        # MOSEK does not support nonconvex problems
+        if solver == "mosek":
+            pytest.skip("MOSEK does not support nonconvex >= quadratic constraints")
+
         status, condition = qc_geq_model.solve(solver, io_api=io_api)
         assert status == "ok"
         assert condition == "optimal"
 
-        # min x+y s.t. x²+y² >= 4 => x = y = √2
+        # min x+y s.t. x²+y² >= 4, x,y >= 0
+        # Optimal: either (0,2) or (2,0) with obj=2
         x_val = float(qc_geq_model.solution["x"].values)
         y_val = float(qc_geq_model.solution["y"].values)
         obj_val = qc_geq_model.objective.value
 
-        sqrt2 = np.sqrt(2)
-        assert np.isclose(x_val, sqrt2, atol=0.01)
-        assert np.isclose(y_val, sqrt2, atol=0.01)
-        assert np.isclose(obj_val, 2 * sqrt2, atol=0.01)
+        # Verify constraint is satisfied
+        assert x_val**2 + y_val**2 >= 4.0 - 0.01
+        # Verify optimal objective value
+        assert np.isclose(obj_val, 2.0, atol=0.01)
 
     @pytest.mark.parametrize("solver,io_api", qc_solver_params)
     def test_qc_equality_constraint(
         self, qc_equality_model: Model, solver: str, io_api: str
     ) -> None:
-        """Test = quadratic constraint."""
+        """Test = quadratic constraint - nonconvex equality."""
+        # MOSEK does not support nonlinear equality constraints
+        if solver == "mosek":
+            pytest.skip("MOSEK does not support nonlinear equality constraints")
+
         status, condition = qc_equality_model.solve(solver, io_api=io_api)
         assert status == "ok"
         assert condition == "optimal"
@@ -871,6 +889,9 @@ class TestQuadraticConstraintSolving:
         y_val = float(qc_equality_model.solution["y"].values)
         obj_val = qc_equality_model.objective.value
 
+        # Verify constraint is satisfied (x² + y² = 25)
+        assert np.isclose(x_val**2 + y_val**2, 25.0, atol=0.1)
+        # Verify optimal solution
         assert np.isclose(x_val, 2.236, atol=0.01)
         assert np.isclose(y_val, 4.472, atol=0.01)
         assert np.isclose(obj_val, 11.18, atol=0.01)
