@@ -427,6 +427,7 @@ def quadratic_constraints_to_file(
     f: BufferedWriter,
     progress: bool = False,
     explicit_coordinate_names: bool = False,
+    write_section_header: bool = True,
 ) -> None:
     """
     Write out quadratic constraints of a model to an LP file.
@@ -436,6 +437,10 @@ def quadratic_constraints_to_file(
     """
     if not len(m.quadratic_constraints):
         return
+
+    # Write "s.t." section header if needed (when there are no linear constraints)
+    if write_section_header and not len(m.constraints):
+        f.write(b"\n\ns.t.\n\n")
 
     print_variable, _ = get_printers_scalar(
         m, explicit_coordinate_names=explicit_coordinate_names
@@ -815,10 +820,11 @@ def to_mosek(
             if Q.nnz > 0:
                 # Get lower triangular part (MOSEK requirement)
                 Q_lower = tril(Q).tocoo()
-                # MOSEK uses 0.5 * x'Qx convention, but our Q is already doubled
-                # So we need to divide by 2
+                # MOSEK uses 0.5 * x'Qx convention, and our Q matrix is already
+                # built with doubled diagonal terms for this convention.
+                # So we pass Q directly without dividing.
                 task.putqconk(con_idx, list(Q_lower.row), list(Q_lower.col),
-                              list(Q_lower.data / 2))
+                              list(Q_lower.data))
 
     return task
 
