@@ -474,7 +474,15 @@ def quadratic_constraints_to_file(
 
         for label in labels:
             label_df = df.filter(pl.col("labels") == label)
-            sign, rhs = label_metadata[int(label)]
+            label_int = int(label)
+            if label_int not in label_metadata:
+                msg = (
+                    f"Label {label_int} from flat representation not found in "
+                    f"constraint metadata for '{name}'. This indicates a mismatch "
+                    "between the flat DataFrame and constraint labels."
+                )
+                raise ValueError(msg)
+            sign, rhs = label_metadata[label_int]
 
             # Start constraint line with label
             constraint_name = clean_name(name)
