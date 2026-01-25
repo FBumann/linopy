@@ -36,6 +36,12 @@ from linopy.common import (
 )
 from linopy.constants import (
     DEFAULT_BREAKPOINT_DIM,
+    DEFAULT_PIECE_DIM,
+    DPWL_BINARY_SUFFIX,
+    DPWL_DELTA_BOUND_SUFFIX,
+    DPWL_DELTA_SUFFIX,
+    DPWL_LINK_SUFFIX,
+    DPWL_SELECT_SUFFIX,
     GREATER_EQUAL,
     HELPER_DIMS,
     LESS_EQUAL,
@@ -135,6 +141,7 @@ class Model:
         "_varnameCounter",
         "_connameCounter",
         "_pwlCounter",
+        "_dpwlCounter",
         "_blocks",
         # TODO: check if these should not be mutable
         "_chunk",
@@ -186,6 +193,7 @@ class Model:
         self._varnameCounter: int = 0
         self._connameCounter: int = 0
         self._pwlCounter: int = 0
+        self._dpwlCounter: int = 0
         self._blocks: DataArray | None = None
 
         self._chunk: T_Chunks = chunk
@@ -862,6 +870,238 @@ class Model:
         # Concatenate along link_dim
         stacked_data = xr.concat(expr_data_list, dim=link_dim)
         return LinearExpression(stacked_data, self)
+
+    def add_discontinuous_piecewise_constraints(
+        self,
+        expr: Variable | LinearExpression | dict[str, Variable | LinearExpression],
+        piece_starts: DataArray,
+        piece_ends: DataArray,
+        link_dim: str | None = None,
+        dim: str = DEFAULT_PIECE_DIM,
+        mask: DataArray | None = None,
+        name: str | None = None,
+        skip_nan_check: bool = False,
+    ) -> Constraint:
+        """
+        Add discontinuous piecewise linear constraints using binary formulation.
+
+        Creates constraints linking expressions through a piecewise linear function
+        that may have gaps or discontinuities between pieces. Uses binary variables
+        to select which piece is active.
+
+        Parameters
+        ----------
+        expr : Variable | LinearExpression | dict[str, Variable | LinearExpression]
+            The expression(s) to constrain. Can be:
+            - A single Variable or LinearExpression
+            - A dict mapping names to Variables/Expressions (for linked quantities)
+        piece_starts : DataArray
+            Values at the start of each piece. Must have the `dim` dimension.
+            For dict expr, must also have `link_dim` dimension matching dict keys.
+        piece_ends : DataArray
+            Values at the end of each piece. Must have same dimensions as piece_starts.
+        link_dim : str, optional
+            Dimension in piece_starts/piece_ends whose coordinates match dict keys.
+            Auto-detected if not provided when expr is a dict.
+        dim : str, default "piece"
+            Name of the piece dimension in piece_starts and piece_ends.
+        mask : DataArray, optional
+            Boolean mask indicating which pieces are valid. If None and
+            skip_nan_check is False, mask is computed from non-NaN values.
+        name : str, optional
+            Base name for generated variables and constraints. Auto-generated
+            as "dpwl0", "dpwl1", etc. if not provided.
+        skip_nan_check : bool, default False
+            If True, skip automatic NaN detection for mask computation.
+            Use when pieces contain no NaN values for better performance.
+
+        Returns
+        -------
+        Constraint
+            The piece selection constraint (sum of binary variables = 1).
+
+        Raises
+        ------
+        ValueError
+            If expr is not a Variable, LinearExpression, or dict of these.
+            If piece_starts/piece_ends don't have the required dim dimension.
+            If piece_starts and piece_ends have different dimensions.
+            If link_dim cannot be auto-detected when expr is a dict.
+            If link_dim coordinates don't match dict keys.
+
+        Examples
+        --------
+        Single variable with discontinuous pieces (gaps between pieces):
+
+        >>> m = Model()
+        >>> x = m.add_variables(name="x")
+        >>> starts = xr.DataArray([0, 15, 30], dims=["piece"])
+        >>> ends = xr.DataArray([10, 25, 50], dims=["piece"])
+        >>> _ = m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
+
+        Multiple linked variables (e.g., power-cost curve with operating regions):
+
+        >>> m = Model()
+        >>> power = m.add_variables(name="power")
+        >>> cost = m.add_variables(name="cost")
+        >>> starts = xr.DataArray(
+        ...     [[0, 60], [0, 150]],
+        ...     dims=["var", "piece"],
+        ...     coords={"var": ["power", "cost"]},
+        ... )
+        >>> ends = xr.DataArray(
+        ...     [[50, 100], [100, 300]],
+        ...     dims=["var", "piece"],
+        ...     coords={"var": ["power", "cost"]},
+        ... )
+        >>> _ = m.add_discontinuous_piecewise_constraints(
+        ...     {"power": power, "cost": cost},
+        ...     starts,
+        ...     ends,
+        ...     link_dim="var",
+        ...     dim="piece",
+        ... )
+
+        Notes
+        -----
+        The discontinuous piecewise linear constraint uses a binary formulation:
+
+        1. Binary variables y_i ∈ {0,1} for each piece i (is piece active?)
+        2. Delta variables δ_i ∈ [0,1] for interpolation within piece i
+        3. Selection constraint: Σ y_i = 1 (exactly one piece active)
+        4. Delta bound: δ_i ≤ y_i (delta only positive if piece active)
+        5. Linking: expr = Σ [start_i · y_i + (end_i - start_i) · δ_i]
+
+        Unlike add_piecewise_constraints (which uses SOS2), this method:
+        - Supports gaps between pieces
+        - Works with any MIP solver (no SOS2 support required)
+        - Uses binary variables (slower than SOS2 for continuous PWL)
+        """
+        # --- Input validation ---
+        if dim not in piece_starts.dims:
+            raise ValueError(
+                f"piece_starts must have dimension '{dim}', "
+                f"but only has dimensions {list(piece_starts.dims)}"
+            )
+        if dim not in piece_ends.dims:
+            raise ValueError(
+                f"piece_ends must have dimension '{dim}', "
+                f"but only has dimensions {list(piece_ends.dims)}"
+            )
+        if piece_starts.dims != piece_ends.dims:
+            raise ValueError(
+                f"piece_starts and piece_ends must have same dimensions. "
+                f"Got {list(piece_starts.dims)} and {list(piece_ends.dims)}"
+            )
+
+        # --- Generate names using counter ---
+        if name is None:
+            name = f"dpwl{self._dpwlCounter}"
+            self._dpwlCounter += 1
+
+        binary_name = f"{name}{DPWL_BINARY_SUFFIX}"
+        delta_name = f"{name}{DPWL_DELTA_SUFFIX}"
+        select_name = f"{name}{DPWL_SELECT_SUFFIX}"
+        delta_bound_name = f"{name}{DPWL_DELTA_BOUND_SUFFIX}"
+        link_name = f"{name}{DPWL_LINK_SUFFIX}"
+
+        # --- Determine variable coordinates, mask, and target expression ---
+        is_single = isinstance(expr, Variable | LinearExpression)
+        is_dict = isinstance(expr, dict)
+
+        if not is_single and not is_dict:
+            raise ValueError(
+                f"'expr' must be a Variable, LinearExpression, or dict of these, "
+                f"got {type(expr)}"
+            )
+
+        # Compute piece deltas (end - start)
+        piece_deltas = piece_ends - piece_starts
+
+        if is_single:
+            # Single expression case
+            target_expr = self._to_linexpr(expr)
+            # Build variable coordinates from piece dimensions
+            var_coords = [
+                pd.Index(piece_starts.coords[d].values, name=d)
+                for d in piece_starts.dims
+            ]
+            var_mask = self._compute_dpwl_mask(
+                mask, piece_starts, piece_ends, skip_nan_check
+            )
+            # For linking: use piece_starts and piece_deltas directly
+            link_starts = piece_starts
+            link_deltas = piece_deltas
+        else:
+            # Dict case - need to validate link_dim and build stacked expression
+            expr_dict = expr
+            expr_keys = set(expr_dict.keys())
+
+            # Auto-detect or validate link_dim (reuse helper from PWL)
+            link_dim = self._resolve_pwl_link_dim(
+                link_dim, piece_starts, dim, expr_keys
+            )
+
+            # Build variable coordinates (exclude link_dim)
+            var_coords = [
+                pd.Index(piece_starts.coords[d].values, name=d)
+                for d in piece_starts.dims
+                if d != link_dim
+            ]
+
+            # Compute mask (valid if ANY linked variable has valid piece)
+            base_mask = self._compute_dpwl_mask(
+                mask, piece_starts, piece_ends, skip_nan_check
+            )
+            var_mask = base_mask.any(dim=link_dim) if base_mask is not None else None
+
+            # Build stacked expression from dict
+            target_expr = self._build_stacked_expr(expr_dict, piece_starts, link_dim)
+
+            # For linking: use full piece_starts and piece_deltas (include link_dim)
+            link_starts = piece_starts
+            link_deltas = piece_deltas
+
+        # --- Create binary and delta variables ---
+        binary_var = self.add_variables(
+            coords=var_coords, name=binary_name, mask=var_mask, binary=True
+        )
+
+        delta_var = self.add_variables(
+            lower=0, upper=1, coords=var_coords, name=delta_name, mask=var_mask
+        )
+
+        # --- Add selection constraint: Σ y_i = 1 ---
+        select_con = self.add_constraints(
+            binary_var.sum(dim=dim) == 1, name=select_name
+        )
+
+        # --- Add delta bound constraint: δ_i ≤ y_i ---
+        self.add_constraints(delta_var <= binary_var, name=delta_bound_name)
+
+        # --- Add linking constraint ---
+        # expr = Σ [start_i · y_i + (end_i - start_i) · δ_i]
+        reconstructed = (link_starts * binary_var + link_deltas * delta_var).sum(
+            dim=dim
+        )
+        self.add_constraints(target_expr == reconstructed, name=link_name)
+
+        return select_con
+
+    def _compute_dpwl_mask(
+        self,
+        mask: DataArray | None,
+        piece_starts: DataArray,
+        piece_ends: DataArray,
+        skip_nan_check: bool,
+    ) -> DataArray | None:
+        """Compute mask for discontinuous PWL, optionally skipping NaN check."""
+        if mask is not None:
+            return mask
+        if skip_nan_check:
+            return None
+        # Piece is valid if both start and end are non-NaN
+        return ~piece_starts.isnull() & ~piece_ends.isnull()
 
     def add_constraints(
         self,

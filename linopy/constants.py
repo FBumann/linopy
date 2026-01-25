@@ -36,11 +36,19 @@ sign_replace_dict: dict[str, str] = {
 TERM_DIM = "_term"
 STACKED_TERM_DIM = "_stacked_term"
 
-# Piecewise linear constraint constants
+# Piecewise linear constraint constants (continuous - SOS2)
 PWL_LAMBDA_SUFFIX = "_lambda"
 PWL_CONVEX_SUFFIX = "_convex"
 PWL_LINK_SUFFIX = "_link"
 DEFAULT_BREAKPOINT_DIM = "breakpoint"
+
+# Discontinuous piecewise linear constraint constants (binary formulation)
+DPWL_BINARY_SUFFIX = "_binary"
+DPWL_DELTA_SUFFIX = "_delta"
+DPWL_SELECT_SUFFIX = "_select"
+DPWL_DELTA_BOUND_SUFFIX = "_delta_bound"
+DPWL_LINK_SUFFIX = "_link"
+DEFAULT_PIECE_DIM = "piece"
 GROUPED_TERM_DIM = "_grouped_term"
 GROUP_DIM = "_group"
 FACTOR_DIM = "_factor"
