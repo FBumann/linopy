@@ -1,18 +1,25 @@
-"""
-Tests for discontinuous piecewise linear constraints using binary formulation.
-"""
+"""Tests for discontinuous piecewise linear constraints using binary formulation."""
+
+from __future__ import annotations
 
 import numpy as np
 import pytest
 import xarray as xr
 
 from linopy import Model, available_solvers
+from linopy.constants import (
+    DPWL_BINARY_SUFFIX,
+    DPWL_DELTA_BOUND_SUFFIX,
+    DPWL_DELTA_SUFFIX,
+    DPWL_LINK_SUFFIX,
+    DPWL_SELECT_SUFFIX,
+)
 
 
 class TestBasicSingleVariable:
     """Tests for single variable discontinuous piecewise constraints."""
 
-    def test_basic_single_variable(self):
+    def test_basic_single_variable(self) -> None:
         """Test basic discontinuous PWL with a single variable."""
         m = Model()
         x = m.add_variables(name="x")
@@ -24,19 +31,19 @@ class TestBasicSingleVariable:
         con = m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
         # Check that variables and constraints were created
-        assert "dpwl0_binary" in m.variables
-        assert "dpwl0_delta" in m.variables
-        assert "dpwl0_select" in m.constraints
-        assert "dpwl0_delta_bound" in m.constraints
-        assert "dpwl0_link" in m.constraints
+        assert f"dpwl0{DPWL_BINARY_SUFFIX}" in m.variables
+        assert f"dpwl0{DPWL_DELTA_SUFFIX}" in m.variables
+        assert f"dpwl0{DPWL_SELECT_SUFFIX}" in m.constraints
+        assert f"dpwl0{DPWL_DELTA_BOUND_SUFFIX}" in m.constraints
+        assert f"dpwl0{DPWL_LINK_SUFFIX}" in m.constraints
 
         # Check binary variable is indeed binary
-        assert m.variables["dpwl0_binary"].attrs.get("binary", False)
+        assert m.variables[f"dpwl0{DPWL_BINARY_SUFFIX}"].attrs.get("binary", False)
 
         # Check return value is the selection constraint
-        assert con.name == "dpwl0_select"
+        assert con.name == f"dpwl0{DPWL_SELECT_SUFFIX}"
 
-    def test_single_variable_with_coords(self):
+    def test_single_variable_with_coords(self) -> None:
         """Test single variable with explicit piece coordinates."""
         m = Model()
         x = m.add_variables(name="x")
@@ -51,7 +58,9 @@ class TestBasicSingleVariable:
         m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
         # Check coordinates are preserved
-        assert list(m.variables["dpwl0_binary"].coords["piece"].values) == [
+        assert list(
+            m.variables[f"dpwl0{DPWL_BINARY_SUFFIX}"].coords["piece"].values
+        ) == [
             "low",
             "mid",
             "high",
@@ -61,7 +70,7 @@ class TestBasicSingleVariable:
 class TestDictOfVariables:
     """Tests for dict of variables (linked quantities)."""
 
-    def test_dict_of_variables(self):
+    def test_dict_of_variables(self) -> None:
         """Test discontinuous PWL with multiple linked variables."""
         m = Model()
         power = m.add_variables(name="power")
@@ -83,11 +92,11 @@ class TestDictOfVariables:
             {"power": power, "cost": cost}, starts, ends, link_dim="var", dim="piece"
         )
 
-        assert "dpwl0_binary" in m.variables
-        assert "dpwl0_delta" in m.variables
-        assert "dpwl0_link" in m.constraints
+        assert f"dpwl0{DPWL_BINARY_SUFFIX}" in m.variables
+        assert f"dpwl0{DPWL_DELTA_SUFFIX}" in m.variables
+        assert f"dpwl0{DPWL_LINK_SUFFIX}" in m.constraints
 
-    def test_dict_with_additional_coords(self):
+    def test_dict_with_additional_coords(self) -> None:
         """Test dict of variables with additional dimensions (e.g., generators)."""
         m = Model()
         generators = ["gen1", "gen2"]
@@ -117,13 +126,13 @@ class TestDictOfVariables:
         )
 
         # Binary/delta variables should have gen and piece dimensions (not var)
-        assert set(m.variables["dpwl0_binary"].dims) == {"gen", "piece"}
+        assert set(m.variables[f"dpwl0{DPWL_BINARY_SUFFIX}"].dims) == {"gen", "piece"}
 
 
 class TestAutoDetectLinkDim:
     """Tests for auto-detection of link_dim."""
 
-    def test_auto_detect_link_dim(self):
+    def test_auto_detect_link_dim(self) -> None:
         """Test that link_dim is auto-detected from piece coordinates."""
         m = Model()
         x = m.add_variables(name="x")
@@ -145,9 +154,9 @@ class TestAutoDetectLinkDim:
             {"x": x, "y": y}, starts, ends, dim="piece"
         )
 
-        assert "dpwl0_binary" in m.variables
+        assert f"dpwl0{DPWL_BINARY_SUFFIX}" in m.variables
 
-    def test_auto_detect_fails_with_no_match(self):
+    def test_auto_detect_fails_with_no_match(self) -> None:
         """Test that auto-detection fails with helpful error when no match."""
         m = Model()
         x = m.add_variables(name="x")
@@ -173,7 +182,7 @@ class TestAutoDetectLinkDim:
 class TestMasking:
     """Tests for masking functionality."""
 
-    def test_nan_masking(self):
+    def test_nan_masking(self) -> None:
         """Test that NaN values in pieces create masked variables."""
         m = Model()
         x = m.add_variables(name="x")
@@ -185,12 +194,12 @@ class TestMasking:
         m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
         # Check that binary variable has only 2 valid entries
-        binary_labels = m.variables["dpwl0_binary"].labels
+        binary_labels = m.variables[f"dpwl0{DPWL_BINARY_SUFFIX}"].labels
         assert binary_labels.isel(piece=0).item() != -1
         assert binary_labels.isel(piece=1).item() != -1
         assert binary_labels.isel(piece=2).item() == -1
 
-    def test_nan_masking_partial(self):
+    def test_nan_masking_partial(self) -> None:
         """Test that piece is invalid if EITHER start OR end is NaN."""
         m = Model()
         x = m.add_variables(name="x")
@@ -201,12 +210,12 @@ class TestMasking:
 
         m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
-        binary_labels = m.variables["dpwl0_binary"].labels
+        binary_labels = m.variables[f"dpwl0{DPWL_BINARY_SUFFIX}"].labels
         assert binary_labels.isel(piece=0).item() != -1  # valid
         assert binary_labels.isel(piece=1).item() == -1  # invalid (NaN end)
         assert binary_labels.isel(piece=2).item() == -1  # invalid (NaN start)
 
-    def test_explicit_mask(self):
+    def test_explicit_mask(self) -> None:
         """Test that explicit mask parameter works."""
         m = Model()
         x = m.add_variables(name="x")
@@ -219,12 +228,12 @@ class TestMasking:
             x, starts, ends, dim="piece", mask=mask
         )
 
-        binary_labels = m.variables["dpwl0_binary"].labels
+        binary_labels = m.variables[f"dpwl0{DPWL_BINARY_SUFFIX}"].labels
         assert binary_labels.isel(piece=0).item() != -1
         assert binary_labels.isel(piece=1).item() == -1  # masked out
         assert binary_labels.isel(piece=2).item() != -1
 
-    def test_skip_nan_check(self):
+    def test_skip_nan_check(self) -> None:
         """Test that skip_nan_check bypasses NaN detection."""
         m = Model()
         x = m.add_variables(name="x")
@@ -238,7 +247,7 @@ class TestMasking:
         )
 
         # All pieces should be created (no mask applied)
-        binary_labels = m.variables["dpwl0_binary"].labels
+        binary_labels = m.variables[f"dpwl0{DPWL_BINARY_SUFFIX}"].labels
         assert binary_labels.isel(piece=0).item() != -1
         assert binary_labels.isel(piece=1).item() != -1
         assert binary_labels.isel(piece=2).item() != -1
@@ -247,7 +256,7 @@ class TestMasking:
 class TestMultiDimensional:
     """Tests for multi-dimensional cases."""
 
-    def test_multi_dimensional_pieces(self):
+    def test_multi_dimensional_pieces(self) -> None:
         """Test with pieces that vary across another dimension."""
         m = Model()
         generators = ["gen1", "gen2"]
@@ -268,14 +277,14 @@ class TestMultiDimensional:
         m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
         # Variables should have both gen and piece dimensions
-        assert set(m.variables["dpwl0_binary"].dims) == {"gen", "piece"}
-        assert set(m.variables["dpwl0_delta"].dims) == {"gen", "piece"}
+        assert set(m.variables[f"dpwl0{DPWL_BINARY_SUFFIX}"].dims) == {"gen", "piece"}
+        assert set(m.variables[f"dpwl0{DPWL_DELTA_SUFFIX}"].dims) == {"gen", "piece"}
 
 
 class TestValidationErrors:
     """Tests for input validation error handling."""
 
-    def test_invalid_expr_type(self):
+    def test_invalid_expr_type(self) -> None:
         """Test that invalid expr type raises ValueError."""
         m = Model()
 
@@ -287,7 +296,7 @@ class TestValidationErrors:
                 "invalid", starts, ends, dim="piece"
             )
 
-    def test_missing_dim_in_starts(self):
+    def test_missing_dim_in_starts(self) -> None:
         """Test error when dim is missing from piece_starts."""
         m = Model()
         x = m.add_variables(name="x")
@@ -298,7 +307,7 @@ class TestValidationErrors:
         with pytest.raises(ValueError, match="piece_starts must have dimension"):
             m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
-    def test_missing_dim_in_ends(self):
+    def test_missing_dim_in_ends(self) -> None:
         """Test error when dim is missing from piece_ends."""
         m = Model()
         x = m.add_variables(name="x")
@@ -309,7 +318,7 @@ class TestValidationErrors:
         with pytest.raises(ValueError, match="piece_ends must have dimension"):
             m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
-    def test_mismatched_dimensions(self):
+    def test_mismatched_dimensions(self) -> None:
         """Test error when starts and ends have different dimensions."""
         m = Model()
         x = m.add_variables(name="x")
@@ -320,7 +329,7 @@ class TestValidationErrors:
         with pytest.raises(ValueError, match="must have same dimensions"):
             m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
-    def test_expression_support(self):
+    def test_expression_support(self) -> None:
         """Test that LinearExpression is supported as input."""
         m = Model()
         x = m.add_variables(name="x")
@@ -332,9 +341,9 @@ class TestValidationErrors:
         # Should not raise
         m.add_discontinuous_piecewise_constraints(x + y, starts, ends, dim="piece")
 
-        assert "dpwl0_link" in m.constraints
+        assert f"dpwl0{DPWL_LINK_SUFFIX}" in m.constraints
 
-    def test_link_dim_not_in_pieces(self):
+    def test_link_dim_not_in_pieces(self) -> None:
         """Test error when link_dim is not in piece arrays."""
         m = Model()
         x = m.add_variables(name="x")
@@ -348,7 +357,7 @@ class TestValidationErrors:
                 {"x": x, "y": y}, starts, ends, link_dim="var", dim="piece"
             )
 
-    def test_link_dim_coords_mismatch(self):
+    def test_link_dim_coords_mismatch(self) -> None:
         """Test error when link_dim coords don't match dict keys."""
         m = Model()
         x = m.add_variables(name="x")
@@ -374,7 +383,7 @@ class TestValidationErrors:
 class TestNameGeneration:
     """Tests for automatic name generation."""
 
-    def test_auto_name_generation(self):
+    def test_auto_name_generation(self) -> None:
         """Test that names are auto-generated with counter."""
         m = Model()
         x = m.add_variables(name="x")
@@ -385,10 +394,10 @@ class TestNameGeneration:
         m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
         m.add_discontinuous_piecewise_constraints(x, starts, ends, dim="piece")
 
-        assert "dpwl0_binary" in m.variables
-        assert "dpwl1_binary" in m.variables
+        assert f"dpwl0{DPWL_BINARY_SUFFIX}" in m.variables
+        assert f"dpwl1{DPWL_BINARY_SUFFIX}" in m.variables
 
-    def test_custom_name(self):
+    def test_custom_name(self) -> None:
         """Test that custom name parameter works."""
         m = Model()
         x = m.add_variables(name="x")
@@ -400,19 +409,19 @@ class TestNameGeneration:
             x, starts, ends, dim="piece", name="my_dpwl"
         )
 
-        assert "my_dpwl_binary" in m.variables
-        assert "my_dpwl_delta" in m.variables
-        assert "my_dpwl_select" in m.constraints
+        assert f"my_dpwl{DPWL_BINARY_SUFFIX}" in m.variables
+        assert f"my_dpwl{DPWL_DELTA_SUFFIX}" in m.variables
+        assert f"my_dpwl{DPWL_SELECT_SUFFIX}" in m.constraints
 
 
 class TestSolverIntegration:
     """Integration tests with actual solver (requires Gurobi, CPLEX, or HiGHS)."""
 
     @pytest.mark.parametrize(
-        "solver,module",
+        ("solver", "module"),
         [("gurobi", "gurobipy"), ("cplex", "cplex"), ("highs", "highspy")],
     )
-    def test_solve_single_variable_gap(self, solver, module):
+    def test_solve_single_variable_gap(self, solver: str, module: str) -> None:
         """Test solving with a gap - should find optimum in valid region."""
         if solver not in available_solvers:
             pytest.skip(f"{solver} not available")
@@ -435,10 +444,10 @@ class TestSolverIntegration:
         assert np.isclose(m.solution["x"].item(), 30.0, atol=1e-5)
 
     @pytest.mark.parametrize(
-        "solver,module",
+        ("solver", "module"),
         [("gurobi", "gurobipy"), ("cplex", "cplex"), ("highs", "highspy")],
     )
-    def test_solve_finds_correct_piece(self, solver, module):
+    def test_solve_finds_correct_piece(self, solver: str, module: str) -> None:
         """Test that solver correctly selects the optimal piece."""
         if solver not in available_solvers:
             pytest.skip(f"{solver} not available")
@@ -474,10 +483,10 @@ class TestSolverIntegration:
         assert np.isclose(m.solution["x"].item(), 30.0, atol=1e-5)
 
     @pytest.mark.parametrize(
-        "solver,module",
+        ("solver", "module"),
         [("gurobi", "gurobipy"), ("cplex", "cplex"), ("highs", "highspy")],
     )
-    def test_solve_step_function(self, solver, module):
+    def test_solve_step_function(self, solver: str, module: str) -> None:
         """Test solving with a step function (discontinuity in y)."""
         if solver not in available_solvers:
             pytest.skip(f"{solver} not available")
