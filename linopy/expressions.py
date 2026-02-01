@@ -1817,11 +1817,28 @@ class LazyLinearExpression(LinearExpression):
     def data(self) -> Dataset:
         if self._data is None:
             object.__setattr__(self, "_data", self._materialize())
+            object.__setattr__(self, "_const_override", None)
         return self._data
 
     @property
     def const(self) -> DataArray:
         if self._const_override is not None:
+            if self.is_lazy and self._const_override.ndim == 0 and self._parts:
+                # Broadcast scalar const to match parts' coord dims.
+                # Use the first part's dims as reference — this is correct
+                # when parts share the same coord space (common case).
+                # For disjoint dims, materialization is needed for full const.
+                ref = self._parts[0]
+                coord_sizes = {
+                    k: v for k, v in ref.sizes.items() if k not in HELPER_DIMS
+                }
+                if coord_sizes:
+                    return self._const_override.broadcast_like(
+                        xr.DataArray(
+                            np.zeros(list(coord_sizes.values())),
+                            dims=list(coord_sizes.keys()),
+                        )
+                    )
             return self._const_override
         return self.data.const
 
@@ -2520,18 +2537,26 @@ def merge(
                     const_arrays.append(d["const"])
                     parts.append(d[["coeffs", "vars"]])
 
-            # Sum constants (cheap — no _term dim involved)
-            subkwargs_const = (
-                {**kwargs, "fill_value": 0}
-                if kwargs
-                else {
-                    "coords": "minimal",
-                    "compat": "override",
-                    "join": "outer",
-                    "fill_value": 0,
-                }
-            )
-            const = xr.concat(const_arrays, "_temp", **subkwargs_const).sum("_temp")
+            # Sum constants — skip zero-valued arrays to avoid creating
+            # a Cartesian product from disjoint dimensions.
+            nonzero_consts = [
+                c
+                for c in const_arrays
+                if not (
+                    isinstance(c.values, np.ndarray)
+                    and c.size > 1
+                    and (c.values == 0).all()
+                    or c.size <= 1
+                    and float(c) == 0.0
+                )
+            ]
+            if not nonzero_consts:
+                const: DataArray = xr.DataArray(0.0)
+            else:
+                const = nonzero_consts[0]
+                for c in nonzero_consts[1:]:
+                    const, c = xr.align(const, c, join="outer", fill_value=0)
+                    const = const + c
 
             return LazyLinearExpression(
                 None,  # type: ignore[arg-type]
