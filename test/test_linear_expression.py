@@ -1451,7 +1451,7 @@ def test_deferred_flat_has_all_variables() -> None:
 
 
 def test_deferred_many_disjoint_parts() -> None:
-    """Sum 20 expressions with disjoint coords, verify deferred.flat is correct."""
+    """Sum 20 expressions with disjoint coords — verify disjoint sum path works."""
     m = Model()
     exprs = []
     for k in range(20):
@@ -1467,16 +1467,19 @@ def test_deferred_many_disjoint_parts() -> None:
         deferred = deferred + e
     assert isinstance(deferred, DeferredLinearExpression)
     assert len(deferred._parts) == 20
+    assert deferred._has_disjoint_dims()
 
-    # Verify flat output has the correct number of entries (20 groups × 5 vars)
-    flat = deferred.flat
+    # Use the disjoint-dims sum path (avoids dense cross-product)
+    summed = deferred.sum()
+    assert isinstance(summed, LinearExpression)
+
+    # Verify summed flat output has the correct number of entries
+    flat = summed.flat
     assert len(flat) == 100  # 20 * 5 variables
 
     # Each part k has coefficient (k+1), 5 variables
-    # Verify coefficients sum up correctly
     for k in range(20):
-        # Variables for part k start at label offset in the model
-        part_flat = exprs[k].flat
+        part_flat = exprs[k].sum().flat
         for _, row in part_flat.iterrows():
             var_id = int(row["vars"])
             matched = flat[flat["vars"] == var_id]

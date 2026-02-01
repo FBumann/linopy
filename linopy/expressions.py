@@ -2295,9 +2295,6 @@ class DeferredLinearExpression:
     dense arrays over the union of all coordinates.  DeferredLinearExpression
     avoids this by storing the parts and only materializing (calling
     ``merge()``) when an operation actually requires the full xarray Dataset.
-
-    Fast-path outputs like ``.flat`` and ``.to_polars()`` concatenate each
-    part's flat output directly, never creating the dense union array.
     """
 
     __slots__ = ("_parts", "_model")
@@ -2341,6 +2338,19 @@ class DeferredLinearExpression:
     @property
     def const(self) -> DataArray:
         return self.materialize().const
+
+    @property
+    def coord_dims(self) -> tuple[Hashable, ...]:
+        all_dims: list[Hashable] = []
+        for p in self._parts:
+            for d in p.coord_dims:
+                if d not in all_dims:
+                    all_dims.append(d)
+        return tuple(all_dims)
+
+    @property
+    def type(self) -> str:
+        return "LinearExpression"
 
     # ------------------------------------------------------------------
     # Lazy arithmetic — return new DeferredLinearExpression
@@ -2406,7 +2416,28 @@ class DeferredLinearExpression:
     def __neg__(self) -> DeferredLinearExpression:
         return DeferredLinearExpression([-p for p in self._parts], self._model)
 
-    def __mul__(self, other: ConstantLike) -> DeferredLinearExpression:
+    def __mul__(
+        self, other: Any
+    ) -> DeferredLinearExpression | QuadraticExpression | NotImplementedType:
+        if isinstance(
+            other,
+            variables.Variable
+            | variables.ScalarVariable
+            | LinearExpression
+            | ScalarLinearExpression
+            | QuadraticExpression
+            | DeferredLinearExpression,
+        ):
+            # Quadratic or expression multiplication — materialize
+            return self.materialize().__mul__(other)
+        try:
+            return DeferredLinearExpression(
+                [p * other for p in self._parts], self._model
+            )
+        except TypeError:
+            return NotImplemented
+
+    def __rmul__(self, other: Any) -> DeferredLinearExpression | NotImplementedType:
         if isinstance(
             other,
             variables.Variable
@@ -2415,15 +2446,7 @@ class DeferredLinearExpression:
             | ScalarLinearExpression
             | QuadraticExpression,
         ):
-            return NotImplemented
-        try:
-            return DeferredLinearExpression(
-                [p * other for p in self._parts], self._model
-            )
-        except TypeError:
-            return NotImplemented
-
-    def __rmul__(self, other: ConstantLike) -> DeferredLinearExpression:
+            return self.materialize().__rmul__(other)
         return self.__mul__(other)
 
     def __truediv__(self, other: ConstantLike) -> DeferredLinearExpression:
@@ -2432,11 +2455,15 @@ class DeferredLinearExpression:
         except TypeError:
             return NotImplemented
 
+    def __pow__(self, other: int) -> QuadraticExpression:
+        return self.materialize().__pow__(other)
+
+    def __matmul__(self, other: Any) -> Any:
+        return self.materialize().__matmul__(other)
+
     def _has_disjoint_dims(self) -> bool:
         """Check if all parts have completely disjoint coordinate dimensions."""
-        from linopy.constants import HELPER_DIMS
-
-        seen: set[str] = set()
+        seen: set[Hashable] = set()
         for p in self._parts:
             dims = {k for k in p.sizes if k not in HELPER_DIMS}
             if dims & seen:
@@ -2459,32 +2486,17 @@ class DeferredLinearExpression:
         return self.materialize().sum(dim=dim, **kwargs)
 
     # ------------------------------------------------------------------
-    # Fast-path outputs — NO dense materialization
+    # Outputs — always materialize for correctness
     # ------------------------------------------------------------------
 
     @property
     def flat(self) -> pd.DataFrame:
-        """
-        Concatenate flat outputs from each part, then groupby-sum.
+        """Materialize and return flat DataFrame."""
+        return self.materialize().flat
 
-        This avoids materializing the full dense cross-product array.
-        The result is equivalent to ``self.materialize().flat`` when each
-        part's variables are independent (disjoint variable labels across
-        the broadcast dimensions).
-        """
-        dfs = [p.flat for p in self._parts]
-        df = pd.concat(dfs, ignore_index=True)
-        df = df.groupby("vars", as_index=False).sum()
-        check_has_nulls(df, name="DeferredLinearExpression")
-        return df
-
-    def to_polars(self) -> pl.DataFrame:
-        """Concatenate polars outputs from each part, then group."""
-        dfs = [p.to_polars() for p in self._parts]
-        df = pl.concat(dfs)
-        df = group_terms_polars(df)
-        check_has_nulls_polars(df, name="DeferredLinearExpression")
-        return df
+    def to_polars(self, **kwargs: Any) -> pl.DataFrame:
+        """Materialize and return polars DataFrame."""
+        return self.materialize().to_polars(**kwargs)
 
     # ------------------------------------------------------------------
     # Constraint / objective helpers — materialize then delegate
@@ -2523,10 +2535,21 @@ class DeferredLinearExpression:
             f"total nterm={self.nterm}"
         )
 
+    def __len__(self) -> int:
+        return len(self.materialize())
+
+    def __bool__(self) -> bool:
+        return bool(self._parts)
+
     def __getattr__(self, name: str) -> Any:
         # Avoid infinite recursion on _parts / _model
         if name.startswith("_"):
             raise AttributeError(name)
+        msg = (
+            f"Accessing '{name}' on DeferredLinearExpression triggers "
+            f"materialization. Call .materialize() explicitly if intended."
+        )
+        warn(msg, stacklevel=2)
         return getattr(self.materialize(), name)
 
 
