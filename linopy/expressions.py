@@ -1265,7 +1265,7 @@ class LinearExpression(BaseExpression):
 
     >>> other = 4 * y
     >>> type(expr + other)
-    <class 'linopy.expressions.LinearExpression'>
+    <class 'linopy.expressions.LazyLinearExpression'>
 
     Multiplying:
 
