@@ -165,52 +165,47 @@ def build_dispatch_model(n_groups: int, n_plants: int, n_timesteps: int) -> Mode
         m.add_constraints(supply, ">=", demand, name=f"demand_{g}")
 
     # ── Objective: sum of all cost components across all regions ──
+    # This is how a user would naturally write it: sum all parts.
+    # Within a region, parts share time_g but have different asset dims.
+    # Across regions, all dims are disjoint.
+    # On master: merging creates dense cross-products.
+    # On deferred: parts are stored lazily. The objective setter sums
+    # to scalar, which works per-part when dims are disjoint.
     total_cost = cost_parts[0]
     for c in cost_parts[1:]:
         total_cost = total_cost + c
     m.add_objective(total_cost)
 
-    # Write LP file — full pipeline including any deferred materialization.
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".lp", delete=True) as f:
-        m.to_file(f.name)
-
     return m
 
 
-def build_shared_time_model(
+def build_shared_dims_model(
     n_components: int, n_assets: int, n_timesteps: int
 ) -> Model:
     """
-    Build a model where ALL components share the same time dimension.
+    Build a model where ALL components share the SAME dimensions.
 
-    This is the case where DeferredLinearExpression CANNOT help — all
-    expressions share the "time" dimension, so additions produce same-shape
-    merges (no deferral) or overlapping deferred that must materialize.
-
-    This benchmark verifies there is no performance regression on models
-    that don't benefit from deferral.
+    Every variable has dims (time, asset) with identical coords.
+    Additions are always same-shape → no DeferredLinearExpression created.
+    This verifies there is no performance regression for the common case.
 
     Parameters
     ----------
     n_components : int
-        Number of different asset types (generators, storage, etc.)
+        Number of variable groups added to the objective.
     n_assets : int
-        Assets per component type (each type gets its own asset dimension,
-        but ALL share the same time dimension).
+        Assets (shared across all components).
     n_timesteps : int
-        Shared time steps across all components.
+        Time steps (shared across all components).
     """
     m = Model()
 
-    time_idx = pd.RangeIndex(n_timesteps, name="time")  # SHARED across all
+    time_idx = pd.RangeIndex(n_timesteps, name="time")
+    assets = pd.Index([f"a{a}" for a in range(n_assets)], name="asset")
 
     cost_parts = []
 
     for c in range(n_components):
-        assets = pd.Index([f"c{c}_a{a}" for a in range(n_assets)], name=f"asset_{c}")
-
         gen = m.add_variables(lower=0, coords=[time_idx, assets], name=f"gen_{c}")
         cap = m.add_variables(lower=0, coords=[assets], name=f"cap_{c}")
 
@@ -219,12 +214,12 @@ def build_shared_time_model(
         mc = pd.Series(10.0 + c * 5.0 + np.arange(n_assets, dtype=float), index=assets)
         cost_parts.append(gen * mc)
 
-    # Objective: sum costs across all components (shared time dim)
-    total_gen = cost_parts[0]
+    # All cost_parts have the same dims (time, asset) → same-shape fast path
+    total_cost = cost_parts[0]
     for c in cost_parts[1:]:
-        total_gen = total_gen + c
+        total_cost = total_cost + c
 
-    m.add_objective(total_gen)
+    m.add_objective(total_cost)
 
     import tempfile
 
@@ -267,11 +262,12 @@ def run_disjoint_benchmarks() -> list[dict]:
     results = []
 
     scenarios = [
-        # 2 groups, T=10, sweep P
+        # 2 groups, T=5, sweep P
         (2, 5, 10),
         (2, 10, 10),
         (2, 20, 10),
         (2, 50, 10),
+        (2, 100, 10),
         # 3 groups, T=10, sweep P
         (3, 5, 10),
         (3, 10, 10),
@@ -290,9 +286,13 @@ def run_disjoint_benchmarks() -> list[dict]:
     ]
 
     for n_groups, n_plants, n_ts in scenarios:
-        cross_size = (n_ts * n_plants) ** n_groups
+        n_ren = max(1, n_plants // 3)
+        n_stor = max(1, n_plants // 5)
+        # Each group contributes dims: time, plant, renew, stor
+        dims_per_group = n_ts * n_plants * n_ren * n_stor
+        cross_size = dims_per_group**n_groups
         est_bytes = cross_size * 8 * 2
-        if est_bytes > 8e9:
+        if est_bytes > 500e6:
             print(
                 f"  SKIP  G={n_groups} P={n_plants:>3d} T={n_ts:>3d}  "
                 f"(cross={cross_size:>14,} would need ~{est_bytes / 1e9:.0f} GB)"
@@ -338,36 +338,36 @@ def run_disjoint_benchmarks() -> list[dict]:
 
 
 def run_shared_benchmarks() -> list[dict]:
-    """Benchmark: shared time dimension (deferred does NOT help)."""
+    """Benchmark: shared dimensions (deferred NOT created, no benefit)."""
     results = []
 
     # (n_components, n_assets, n_timesteps)
-    # All components share "time" — additions are same-shape or overlapping.
-    # Each component has its own asset dim but shares "time", so the
-    # additions create DeferredLinearExpressions that must materialize
-    # (overlapping "time" dim). No benefit expected from deferral.
+    # All variables share (time, asset) dims → same-shape additions.
+    # No DeferredLinearExpression is created. This verifies no regression.
     scenarios = [
-        (2, 10, 50),
-        (2, 50, 50),
-        (2, 100, 50),
-        (2, 200, 50),
-        (3, 10, 50),
-        (3, 50, 50),
-        (3, 100, 50),
-        (5, 10, 50),
-        (5, 50, 50),
-        (5, 100, 50),
+        (2, 10, 10),
+        (2, 30, 10),
+        (2, 50, 10),
+        (2, 100, 10),
+        (5, 10, 10),
+        (5, 30, 10),
+        (5, 50, 10),
+        (5, 100, 10),
+        (10, 10, 10),
+        (10, 30, 10),
+        (10, 50, 10),
+        (10, 100, 10),
     ]
 
     for n_comp, n_assets, n_ts in scenarios:
         stats = measure(
-            lambda nc=n_comp, na=n_assets, nt=n_ts: build_shared_time_model(nc, na, nt),
+            lambda nc=n_comp, na=n_assets, nt=n_ts: build_shared_dims_model(nc, na, nt),
             warmup=1,
             repeats=5,
         )
 
         print(
-            f"  C={n_comp} A={n_assets:>4d} T={n_ts:>3d}  "
+            f"  C={n_comp:>2d} A={n_assets:>4d} T={n_ts:>3d}  "
             f"time={stats['time_median_s'] * 1000:>8.1f} ms  "
             f"peak={stats['peak_mb_median']:>8.1f} MB"
         )

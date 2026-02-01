@@ -2478,7 +2478,8 @@ class DeferredLinearExpression:
         When summing over all dimensions (dim=None) and parts have completely
         disjoint coordinate dimensions, each part is summed independently and
         then merged — avoiding the dense cross-product. Otherwise,
-        materialization is needed to ensure correct broadcasting semantics.
+        materialization is needed to ensure correct broadcasting semantics
+        (shared dims cause implicit broadcasting before summation).
         """
         if dim is None and self._has_disjoint_dims():
             summed = [p.sum(**kwargs) for p in self._parts]
