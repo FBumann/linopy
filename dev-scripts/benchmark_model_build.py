@@ -71,7 +71,7 @@ def story1_model(n_contributors=300, n_effects=20, n_time=2000):
 
 
 def story2_model(n_nodes=50, n_lines=30, n_vehicles=40, n_routes=20, n_time=100):
-    """Disjoint-dim Cartesian product + constraint."""
+    """Disjoint-dim Cartesian product + constraint + objective (realistic user workflow)."""
     m = linopy.Model()
     x = m.add_variables(
         coords=[range(n_nodes), range(n_lines), range(n_time)],
@@ -83,7 +83,8 @@ def story2_model(n_nodes=50, n_lines=30, n_vehicles=40, n_routes=20, n_time=100)
         dims=["vehicle", "route", "time"],
         name="y",
     )
-    m.add_constraints(2 * x + 3 * y <= 1, name="capacity")
+    total = 2 * x + 3 * y
+    m.add_constraints(total <= 1, name="capacity")
     m.add_objective(x.sum() + y.sum())
     return m
 
@@ -126,15 +127,32 @@ SWEEP_SIZES = {
             "n_routes": int(n * 0.4),
             "n_time": t,
         }
-        for n, t in [(5, 20), (10, 30), (10, 50), (20, 50)]
+        for n, t in [
+            (5, 20),
+            (10, 50),
+            (20, 50),
+            (20, 100),
+            (30, 100),
+            (40, 100),
+            (50, 100),
+        ]
     ],
     "pypsa": [{"snapshots": s} for s in [10, 50, 100, 200]],
 }
 
 
+_prev_model = [None]  # mutable container to hold ref for cleanup
+
+
 def benchmark_model(builder, kwargs):
     """Build a model and return peak memory (MB) and build time (s)."""
+    # Clean up previous model before measuring
+    _prev_model[0] = None
     gc.collect()
+
+    # Stop any lingering tracemalloc session, then start fresh
+    if tracemalloc.is_tracing():
+        tracemalloc.stop()
     tracemalloc.start()
     tracemalloc.reset_peak()
 
@@ -152,9 +170,11 @@ def benchmark_model(builder, kwargs):
         nvars = model.nvars
         ncons = model.ncons
     else:
-        # pypsa model
         nvars = getattr(model, "nvars", 0)
         ncons = getattr(model, "ncons", 0)
+
+    # Keep model alive until next call so nvars/ncons are read before cleanup
+    _prev_model[0] = model
 
     return {
         "peak_memory_mb": peak / 1e6,
@@ -196,12 +216,11 @@ def run_benchmarks(model_types=None, label=""):
 # ---------------------------------------------------------------------------
 
 
-def plot_comparison(files):
-    """4-panel comparison plot for 2+ result files."""
+def plot_comparison(files, focus="story2"):
+    """3-panel comparison plot focused on a single model type."""
     import matplotlib.pyplot as plt
 
     datasets = []
-    markers = ["o", "s", "^", "D", "v", "P"]
     for fpath in files:
         with open(fpath) as f:
             d = json.load(f)
@@ -210,99 +229,124 @@ def plot_comparison(files):
 
     baseline = datasets[0]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    branch_colors = ["#1b9e77", "#d95f02", "#7570b3", "#e7298a", "#66a61e"]
+    branch_linestyles = ["-", "--", ":"]
+    ms = 10
+    lw = 2.5
 
-    # Panel 1: Peak memory vs nvars (all models, log-log)
-    ax = axes[0, 0]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+
+    # Panel 1: Peak memory vs ncons
+    ax = axes[0]
     for i, data in enumerate(datasets):
-        nvars, mem = [], []
-        for runs in data["models"].values():
-            for r in runs:
-                nvars.append(r["nvars"])
-                mem.append(r["peak_memory_mb"])
-        ax.scatter(
-            nvars, mem, label=data["label"], marker=markers[i % len(markers)], alpha=0.7
+        if focus not in data["models"]:
+            continue
+        c = branch_colors[i % len(branch_colors)]
+        ls = branch_linestyles[i % len(branch_linestyles)]
+        runs = data["models"][focus]
+        ncons = [r["ncons"] for r in runs]
+        mem = [r["peak_memory_mb"] for r in runs]
+        ax.plot(
+            ncons,
+            mem,
+            marker="o",
+            color=c,
+            linestyle=ls,
+            linewidth=lw,
+            markersize=ms,
+            alpha=0.85,
+            label=data["label"],
         )
     ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("nvars")
+    ax.set_xlabel("ncons")
     ax.set_ylabel("Peak Memory (MB)")
-    ax.set_title("Peak Memory vs Model Size")
-    ax.legend()
+    ax.set_title(f"{focus}: Peak Memory")
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
     # Panel 2: Memory ratio vs baseline
-    ax = axes[0, 1]
-    for i, data in enumerate(datasets[1:], 1):
-        for mtype in set(baseline["models"]) & set(data["models"]):
-            runs_base = {
-                json.dumps(r["params"], sort_keys=True): r
-                for r in baseline["models"][mtype]
-            }
+    ax = axes[1]
+    if focus in baseline["models"]:
+        runs_base = {
+            json.dumps(r["params"], sort_keys=True): r
+            for r in baseline["models"][focus]
+        }
+        for i, data in enumerate(datasets[1:], 1):
+            if focus not in data["models"]:
+                continue
+            c = branch_colors[i % len(branch_colors)]
+            ls = branch_linestyles[i % len(branch_linestyles)]
             runs_cur = {
                 json.dumps(r["params"], sort_keys=True): r
-                for r in data["models"][mtype]
+                for r in data["models"][focus]
             }
-            for key in set(runs_base) & set(runs_cur):
+            xs, ys, annots = [], [], []
+            for key in sorted(set(runs_base) & set(runs_cur)):
                 rb, rc = runs_base[key], runs_cur[key]
                 ratio = rc["peak_memory_mb"] / max(rb["peak_memory_mb"], 1e-6)
-                ax.scatter(
-                    rb["nvars"],
-                    ratio,
-                    marker=markers[i % len(markers)],
-                    alpha=0.7,
-                    label=f"{data['label']} ({mtype})",
+                xs.append(rb["ncons"])
+                ys.append(ratio)
+                annots.append(f"{ratio:.2f}")
+            ax.plot(
+                xs,
+                ys,
+                marker="o",
+                color=c,
+                linestyle=ls,
+                linewidth=lw,
+                markersize=ms,
+                alpha=0.85,
+                label=data["label"],
+            )
+            for x, y, txt in zip(xs, ys, annots):
+                ax.annotate(
+                    txt,
+                    (x, y),
+                    textcoords="offset points",
+                    xytext=(0, 10),
+                    ha="center",
+                    fontsize=8,
+                    color=c,
                 )
-    ax.axhline(1.0, color="k", linestyle="--", alpha=0.5)
+    ax.axhline(1.0, color="k", linestyle="--", linewidth=1.5, alpha=0.6)
     ax.set_xscale("log")
-    ax.set_xlabel("nvars")
+    ax.set_xlabel("ncons")
     ax.set_ylabel(f"Memory Ratio (vs {baseline['label']})")
-    ax.set_title("Memory Ratio vs Baseline")
+    ax.set_title(f"{focus}: Memory Ratio")
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
-    handles, labels_ = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels_, handles))
-    ax.legend(by_label.values(), by_label.keys(), fontsize=7)
 
-    # Panel 3: Story 1 detail
-    ax = axes[1, 0]
+    # Panel 3: Build time vs ncons
+    ax = axes[2]
     for i, data in enumerate(datasets):
-        if "story1" in data["models"]:
-            runs = data["models"]["story1"]
-            nvars = [r["nvars"] for r in runs]
-            mem = [r["peak_memory_mb"] for r in runs]
-            ax.plot(
-                nvars,
-                mem,
-                marker=markers[i % len(markers)],
-                label=data["label"],
-                alpha=0.7,
-            )
-    ax.set_xlabel("nvars")
-    ax.set_ylabel("Peak Memory (MB)")
-    ax.set_title("Story 1: Sparse Mask + .sum()")
-    ax.legend()
+        if focus not in data["models"]:
+            continue
+        c = branch_colors[i % len(branch_colors)]
+        ls = branch_linestyles[i % len(branch_linestyles)]
+        runs = data["models"][focus]
+        ncons = [r["ncons"] for r in runs]
+        times = [r["build_time_s"] for r in runs]
+        ax.plot(
+            ncons,
+            times,
+            marker="o",
+            color=c,
+            linestyle=ls,
+            linewidth=lw,
+            markersize=ms,
+            alpha=0.85,
+            label=data["label"],
+        )
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("ncons")
+    ax.set_ylabel("Build Time (s)")
+    ax.set_title(f"{focus}: Build Time")
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-    # Panel 4: Story 2 detail
-    ax = axes[1, 1]
-    for i, data in enumerate(datasets):
-        if "story2" in data["models"]:
-            runs = data["models"]["story2"]
-            nvars = [r["nvars"] for r in runs]
-            mem = [r["peak_memory_mb"] for r in runs]
-            ax.plot(
-                nvars,
-                mem,
-                marker=markers[i % len(markers)],
-                label=data["label"],
-                alpha=0.7,
-            )
-    ax.set_xlabel("nvars")
-    ax.set_ylabel("Peak Memory (MB)")
-    ax.set_title("Story 2: Disjoint-Dim Cartesian Product")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
+    fig.suptitle(f"Model Build Benchmark — {focus}", fontsize=14, fontweight="bold")
     fig.tight_layout()
     plt.savefig("benchmark_model_build.png", dpi=150)
     print("Saved benchmark_model_build.png")
