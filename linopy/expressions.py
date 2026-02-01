@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -868,6 +869,11 @@ class BaseExpression(ABC):
             raise ValueError(
                 f"Both sides of the constraint are constant. At least one side must contain variables. {self} {rhs}"
             )
+
+        # If rhs is a LazyLinearExpression, delegate to its to_constraint
+        # so the lazy paths (coord-disjoint, redistribute) can be tried.
+        if isinstance(rhs, LazyLinearExpression) and rhs.is_lazy:
+            return (self - rhs).to_constraint(sign, 0)
 
         all_to_lhs = (self - rhs).data
         data = assign_multiindex_safe(
@@ -1784,6 +1790,113 @@ def _parts_are_disjoint(parts: list[Dataset]) -> bool:
     return True
 
 
+def _parts_are_coord_disjoint(parts: list[Dataset]) -> bool:
+    """
+    Check if parts have non-overlapping coordinate spaces.
+
+    Two parts are coordinate-disjoint if, for every pair that shares
+    dimension names, at least one shared dimension has completely
+    non-overlapping coordinate values.  All parts must have at least
+    one non-helper dimension (scalars need broadcasting, not slicing).
+    """
+    all_coord_dims = [{k for k in p.sizes if k not in HELPER_DIMS} for p in parts]
+    if not all(all_coord_dims):
+        return False
+    for i, pi in enumerate(parts):
+        dims_i = {k for k in pi.sizes if k not in HELPER_DIMS}
+        for pj in parts[i + 1 :]:
+            dims_j = {k for k in pj.sizes if k not in HELPER_DIMS}
+            shared = dims_i & dims_j
+            if not shared:
+                continue
+            disjoint_on_some_dim = False
+            for d in shared:
+                if d in pi.coords and d in pj.coords:
+                    vals_i = set(pi[d].values.flat)
+                    vals_j = set(pj[d].values.flat)
+                    if not (vals_i & vals_j):
+                        disjoint_on_some_dim = True
+                        break
+            if not disjoint_on_some_dim:
+                return False
+    return True
+
+
+def _try_redistribute(parts: list[Dataset]) -> list[Dataset] | None:
+    """
+    Redistribute parts so a broad part is sliced into coord-disjoint pieces.
+
+    When one part spans the full coordinate space (e.g. a variable with all
+    contributors × effects × time) and the remaining parts cover disjoint
+    subsets, this slices the broad part to each narrow part's coordinates
+    and concatenates along ``_term``.  The result is a list of parts that
+    are coordinate-disjoint and can be used in the lazy constraint path.
+    """
+    if len(parts) <= 1:
+        return None
+
+    coord_dims_per = [{k for k in p.sizes if k not in HELPER_DIMS} for p in parts]
+    # All parts must share the same coord dims
+    if len(set(frozenset(d) for d in coord_dims_per)) != 1:
+        return None
+    coord_dims = coord_dims_per[0]
+    if not coord_dims:
+        return None
+
+    # Find broadest part by total element count; must be strictly largest
+    sizes = [math.prod(p.sizes[d] for d in coord_dims) for p in parts]
+    max_size = max(sizes)
+    if sizes.count(max_size) != 1:
+        return None  # multiple parts with same max size → no clear broad part
+    broad_idx = sizes.index(max_size)
+    broad = parts[broad_idx]
+    narrow_parts = [p for i, p in enumerate(parts) if i != broad_idx]
+
+    if not narrow_parts:
+        return None
+
+    # Narrow parts must be pairwise coord-disjoint
+    if not _parts_are_coord_disjoint(narrow_parts):
+        return None
+
+    # Tiling check: narrow parts must perfectly tile the broad part
+    broad_total = sizes[broad_idx]
+    narrow_total = sum(math.prod(p.sizes[d] for d in coord_dims) for p in narrow_parts)
+    for dim in coord_dims:
+        broad_vals = set(broad[dim].values.flat)
+        narrow_vals: set = set()
+        for n in narrow_parts:
+            if dim in n.coords:
+                narrow_vals |= set(n[dim].values.flat)
+        if not narrow_vals >= broad_vals:
+            return None
+    if narrow_total != broad_total:
+        # Cross-product gaps → fall back
+        return None
+
+    # Redistribute: slice broad into each narrow's coordinate space
+    enriched: list[Dataset] = []
+    for n in narrow_parts:
+        sel_dict = {}
+        for dim in coord_dims:
+            if dim in n.coords and dim in broad.coords:
+                sel_dict[dim] = n[dim]
+        sliced = broad.sel(sel_dict) if sel_dict else broad
+        combined = xr.concat(
+            [n, sliced],
+            TERM_DIM,
+            coords="minimal",
+            compat="override",
+            join="override",
+            fill_value=FILL_VALUE,
+        )
+        for d in set(HELPER_DIMS) & set(combined.coords):
+            combined = combined.reset_index(d, drop=True)
+        enriched.append(combined)
+
+    return enriched
+
+
 class LazyLinearExpression(LinearExpression):
     """
     A LinearExpression that defers merge along _term.
@@ -2078,29 +2191,88 @@ class LazyLinearExpression(LinearExpression):
         # mutually disjoint coord dims. When parts share coords or have
         # empty dims (scalars), they must be merged so each constraint
         # label spans all terms at the same coordinate.
-        if not _parts_are_disjoint(lhs._parts):
-            # Materialize and use standard path
-            return LinearExpression.to_constraint(lhs, sign, 0)
-
-        # Build per-part constraint datasets
-        # Use raw _const_override (scalar) to avoid broadcasting across
-        # disjoint dimensions when assigning rhs to each part
-        raw_const = (
-            lhs._const_override
-            if lhs._const_override is not None
-            else xr.DataArray(0.0)
-        )
-        rhs_val = -raw_const
-        constraint_parts: list[Dataset] = []
-        for part in lhs._parts:
-            ds = assign_multiindex_safe(
-                part[["coeffs", "vars"]], sign=sign, rhs=rhs_val
+        if _parts_are_disjoint(lhs._parts):
+            # Build per-part constraint datasets
+            # Use raw _const_override (scalar) to avoid broadcasting across
+            # disjoint dimensions when assigning rhs to each part
+            raw_const = (
+                lhs._const_override
+                if lhs._const_override is not None
+                else xr.DataArray(0.0)
             )
-            constraint_parts.append(ds)
+            rhs_val = -raw_const
+            constraint_parts: list[Dataset] = []
+            for part in lhs._parts:
+                ds = assign_multiindex_safe(
+                    part[["coeffs", "vars"]], sign=sign, rhs=rhs_val
+                )
+                constraint_parts.append(ds)
 
-        return constraints.Constraint(
-            None, model=self.model, lazy_parts=constraint_parts
-        )
+            return constraints.Constraint(
+                None, model=self.model, lazy_parts=constraint_parts
+            )
+
+        # Parts share dimension names but may be disjoint by coordinate values
+        if _parts_are_coord_disjoint(lhs._parts):
+            raw_const = (
+                lhs._const_override
+                if lhs._const_override is not None
+                else xr.DataArray(0.0)
+            )
+            rhs_val = -raw_const
+            constraint_parts_cd: list[Dataset] = []
+            for part in lhs._parts:
+                part_rhs = rhs_val
+                if isinstance(rhs_val, xr.DataArray) and rhs_val.dims:
+                    sel = {
+                        d: part[d]
+                        for d in rhs_val.dims
+                        if d in part.coords and d not in HELPER_DIMS
+                    }
+                    if sel:
+                        part_rhs = rhs_val.sel(sel)
+                ds = assign_multiindex_safe(
+                    part[["coeffs", "vars"]], sign=sign, rhs=part_rhs
+                )
+                constraint_parts_cd.append(ds)
+
+            return constraints.Constraint(
+                None, model=self.model, lazy_parts=constraint_parts_cd
+            )
+
+        # Try redistribute: slice a broad part across coord-disjoint narrows
+        # Use raw parts (not compacted) because _compact merges same-shape
+        # parts with different coordinates, destroying the tiling structure.
+        redistributed = _try_redistribute(lhs._parts)
+        if redistributed is not None:
+            raw_const = (
+                lhs._const_override
+                if lhs._const_override is not None
+                else xr.DataArray(0.0)
+            )
+            rhs_val = -raw_const
+            constraint_parts_rd: list[Dataset] = []
+            for part in redistributed:
+                part_rhs = rhs_val
+                if isinstance(rhs_val, xr.DataArray) and rhs_val.dims:
+                    sel = {
+                        d: part[d]
+                        for d in rhs_val.dims
+                        if d in part.coords and d not in HELPER_DIMS
+                    }
+                    if sel:
+                        part_rhs = rhs_val.sel(sel)
+                ds = assign_multiindex_safe(
+                    part[["coeffs", "vars"]], sign=sign, rhs=part_rhs
+                )
+                constraint_parts_rd.append(ds)
+
+            return constraints.Constraint(
+                None, model=self.model, lazy_parts=constraint_parts_rd
+            )
+
+        # Fall back to materialization
+        return LinearExpression.to_constraint(lhs, sign, 0)
 
     def to_polars(self) -> pl.DataFrame:
         """Convert the expression to a polars DataFrame without materializing."""
