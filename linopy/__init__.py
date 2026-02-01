@@ -16,7 +16,12 @@ from linopy.common import align
 from linopy.config import options
 from linopy.constants import EQUAL, GREATER_EQUAL, LESS_EQUAL
 from linopy.constraints import Constraint, Constraints
-from linopy.expressions import LinearExpression, QuadraticExpression, merge
+from linopy.expressions import (
+    DeferredLinearExpression,
+    LinearExpression,
+    QuadraticExpression,
+    merge,
+)
 from linopy.io import read_netcdf
 from linopy.model import Model, Variable, Variables, available_solvers
 from linopy.objective import Objective
@@ -25,6 +30,7 @@ from linopy.remote import OetcHandler, RemoteHandler
 __all__ = (
     "Constraint",
     "Constraints",
+    "DeferredLinearExpression",
     "EQUAL",
     "GREATER_EQUAL",
     "LESS_EQUAL",

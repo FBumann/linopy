@@ -3,7 +3,12 @@ from __future__ import annotations
 from xarray.testing import assert_equal
 
 from linopy.constraints import Constraint, _con_unwrap
-from linopy.expressions import LinearExpression, QuadraticExpression, _expr_unwrap
+from linopy.expressions import (
+    DeferredLinearExpression,
+    LinearExpression,
+    QuadraticExpression,
+    _expr_unwrap,
+)
 from linopy.model import Model
 from linopy.variables import Variable, _var_unwrap
 
@@ -17,6 +22,10 @@ def assert_linequal(
     a: LinearExpression | QuadraticExpression, b: LinearExpression | QuadraticExpression
 ) -> None:
     """Assert that two linear expressions are equal."""
+    if isinstance(a, DeferredLinearExpression):
+        a = a.materialize()
+    if isinstance(b, DeferredLinearExpression):
+        b = b.materialize()
     assert isinstance(a, LinearExpression)
     assert isinstance(b, LinearExpression)
     return assert_equal(_expr_unwrap(a), _expr_unwrap(b))

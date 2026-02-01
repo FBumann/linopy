@@ -16,7 +16,7 @@ from xarray.testing import assert_equal
 
 from linopy import LinearExpression, Model, QuadraticExpression, Variable, merge
 from linopy.constants import HELPER_DIMS, TERM_DIM
-from linopy.expressions import ScalarLinearExpression
+from linopy.expressions import DeferredLinearExpression, ScalarLinearExpression
 from linopy.testing import assert_linequal, assert_quadequal
 from linopy.variables import ScalarVariable
 
@@ -1313,3 +1313,267 @@ def test_simplify_partial_cancellation(x: Variable, y: Variable) -> None:
     assert all(simplified.coeffs.values == 3.0), (
         f"Expected coefficient 3.0, got {simplified.coeffs.values}"
     )
+
+
+# =====================================================================
+# DeferredLinearExpression tests
+# =====================================================================
+
+
+def test_deferred_creation_different_shapes() -> None:
+    """Adding expressions with different coord dims produces DeferredLinearExpression."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    result = 3 * x + 4 * y
+    assert isinstance(result, DeferredLinearExpression)
+    assert len(result._parts) == 2
+
+
+def test_deferred_not_created_same_shapes() -> None:
+    """Adding expressions with same coord dims stays LinearExpression."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="y")
+
+    result = 3 * x + 4 * y
+    assert isinstance(result, LinearExpression)
+
+
+def test_deferred_materialize_equivalence() -> None:
+    """Materialized deferred gives same result as eager merge."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    eager = merge([3 * x, 4 * y], cls=LinearExpression)
+
+    assert_linequal(deferred, eager)
+
+
+def test_deferred_chain_flattens_parts() -> None:
+    """Chaining adds flattens nested DeferredLinearExpressions."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+    z = m.add_variables(coords=[pd.Index([0, 1], name="k")], name="z")
+
+    result = 3 * x + 4 * y + 2 * z
+    assert isinstance(result, DeferredLinearExpression)
+    assert len(result._parts) == 3
+
+
+def test_deferred_neg() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    result = -(3 * x + 4 * y)
+    assert isinstance(result, DeferredLinearExpression)
+    mat = result.materialize()
+    assert (mat.coeffs.sel(i=0, j=0).values == [-3, -4]).all()
+
+
+def test_deferred_mul() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    result = (3 * x + 4 * y) * 2
+    assert isinstance(result, DeferredLinearExpression)
+    mat = result.materialize()
+    assert (mat.coeffs.sel(i=0, j=0).values == [6, 8]).all()
+
+
+def test_deferred_sub() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    result = 3 * x - 4 * y
+    assert isinstance(result, DeferredLinearExpression)
+    mat = result.materialize()
+    assert (mat.coeffs.sel(i=0, j=0).values == [3, -4]).all()
+
+
+def test_deferred_to_constraint() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    con = deferred >= 0
+    assert con is not None
+
+
+def test_deferred_add_constraints() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    m.add_constraints(deferred, ">=", 0, name="con1")
+    assert "con1" in m.constraints
+
+
+def test_deferred_add_objective() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    m.add_objective(deferred)
+
+
+def test_deferred_sum_materializes() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    result = deferred.sum()
+    assert isinstance(result, LinearExpression)
+
+
+def test_deferred_flat_has_all_variables() -> None:
+    """Deferred .flat includes all variables from all parts."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    flat = deferred.flat
+    # 3 x-vars + 2 y-vars = 5 total
+    assert len(flat) == 5
+    assert set(flat["vars"].values) == {0, 1, 2, 3, 4}
+
+
+def test_deferred_many_disjoint_parts() -> None:
+    """Sum 20 expressions with disjoint coords — verify disjoint sum path works."""
+    m = Model()
+    exprs = []
+    for k in range(20):
+        v = m.add_variables(
+            coords=[pd.Index([k * 10 + j for j in range(5)], name=f"d{k}")],
+            name=f"v{k}",
+        )
+        exprs.append((k + 1) * v)
+
+    # Build deferred via chained addition
+    deferred = exprs[0]
+    for e in exprs[1:]:
+        deferred = deferred + e
+    assert isinstance(deferred, DeferredLinearExpression)
+    assert len(deferred._parts) == 20
+    assert deferred._has_disjoint_dims()
+
+    # Use the disjoint-dims sum path (avoids dense cross-product)
+    summed = deferred.sum()
+    assert isinstance(summed, LinearExpression)
+
+    # Verify summed flat output has the correct number of entries
+    flat = summed.flat
+    assert len(flat) == 100  # 20 * 5 variables
+
+    # Each part k has coefficient (k+1), 5 variables
+    for k in range(20):
+        part_flat = exprs[k].sum().flat
+        for _, row in part_flat.iterrows():
+            var_id = int(row["vars"])
+            matched = flat[flat["vars"] == var_id]
+            assert len(matched) == 1
+            assert matched.iloc[0]["coeffs"] == row["coeffs"]
+
+
+def test_deferred_flat_disjoint_uses_fast_path() -> None:
+    """Disjoint-dims .flat avoids materialization and gives correct results."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    assert isinstance(deferred, DeferredLinearExpression)
+    assert deferred._has_disjoint_dims()
+
+    # Fast-path flat should match per-part results
+    flat = deferred.flat
+    assert len(flat) == 4  # 2 x-vars + 2 y-vars
+    x_flat = (3 * x).flat
+    y_flat = (4 * y).flat
+    for _, row in x_flat.iterrows():
+        matched = flat[flat["vars"] == row["vars"]]
+        assert matched.iloc[0]["coeffs"] == row["coeffs"]
+    for _, row in y_flat.iterrows():
+        matched = flat[flat["vars"] == row["vars"]]
+        assert matched.iloc[0]["coeffs"] == row["coeffs"]
+
+
+def test_deferred_flat_overlapping_concats_per_part() -> None:
+    """Overlapping-dims .flat concats per-part without materialization."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    z = m.add_variables(
+        coords=[pd.Index([0, 1], name="i"), pd.Index([0, 1, 2], name="j")], name="z"
+    )
+
+    deferred = 3 * x + 2 * z
+    assert isinstance(deferred, DeferredLinearExpression)
+    assert not deferred._has_disjoint_dims()
+
+    # Per-part .flat: x-vars get coeff 3 (no broadcasting across j),
+    # z-vars get coeff 2. Each part is independent.
+    df = deferred.flat
+    x_labels = set(x.data.labels.values.flat)
+    z_labels = set(z.data.labels.values.flat)
+    x_rows = df[df.vars.isin(x_labels)]
+    z_rows = df[df.vars.isin(z_labels)]
+    assert (x_rows.coeffs == 3).all()
+    assert (z_rows.coeffs == 2).all()
+
+
+def test_deferred_sel_per_part() -> None:
+    """sel() on disjoint deferred applies only to the relevant part."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    assert isinstance(deferred, DeferredLinearExpression)
+
+    # sel on dim "i" should only affect the x-part
+    result = deferred.sel(i=0)
+    assert isinstance(result, DeferredLinearExpression)
+    assert len(result._parts) == 2
+    # x-part is now scalar (i selected), y-part is unchanged
+    assert result._parts[0].coord_dims == ()
+    assert result._parts[1].coord_dims == ("j",)
+
+
+def test_deferred_rename_per_part() -> None:
+    """rename() on disjoint deferred applies only to the relevant part."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    renamed = deferred.rename({"i": "k"})
+    assert isinstance(renamed, DeferredLinearExpression)
+    assert renamed._parts[0].coord_dims == ("k",)
+    assert renamed._parts[1].coord_dims == ("j",)
+
+
+def test_deferred_shift_per_part() -> None:
+    """shift() on disjoint deferred applies only to the relevant part."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    shifted = deferred.shift(i=1)
+    assert isinstance(shifted, DeferredLinearExpression)
+    # y-part should be unchanged
+    from linopy.testing import assert_linequal
+
+    assert_linequal(shifted._parts[1], (4 * y))
