@@ -64,6 +64,8 @@ print(type(total).__name__)  # DeferredLinearExpression on feature branch
 **Hypothesis**: The Cartesian product is unnecessary — both sides are
 independent. The solver only needs the non-zero `(var_id, coeff)` pairs.
 
+**Profiling**: See `dev-scripts/story2_profile.md` for detailed scalene/tracemalloc results.
+
 ---
 
 ## Story 3: Different Coordinate Subsets on Same Dimension
@@ -96,6 +98,8 @@ if hasattr(total, "sizes"):
 (each expression's own subset), not expand to the union of all 420+ unique
 contributor names.
 
+**Profiling**: See `dev-scripts/story3_profile.md` for detailed tracemalloc results.
+
 ---
 
 ## Story 4: `add_constraints` Broadcasts Before Masking
@@ -124,6 +128,8 @@ m.add_constraints(var <= 1, name="limit", mask=mask)
 
 **Hypothesis**: The full broadcast allocates memory for all 400K elements, then
 mask sets 85% of labels to -1. Memory for the masked-out portion is wasted.
+
+**Profiling**: See `dev-scripts/story4_profile.md` for detailed tracemalloc results.
 
 ---
 
