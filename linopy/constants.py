@@ -34,6 +34,7 @@ sign_replace_dict: dict[str, str] = {
 }
 
 DEFAULT_LABEL_DTYPE = np.int32
+DEFAULT_FLOAT_DTYPE = np.float32
 
 TERM_DIM = "_term"
 STACKED_TERM_DIM = "_stacked_term"

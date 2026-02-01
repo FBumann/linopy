@@ -68,6 +68,7 @@ from linopy.common import (
 from linopy.config import options
 from linopy.constants import (
     CV_DIM,
+    DEFAULT_FLOAT_DTYPE,
     DEFAULT_LABEL_DTYPE,
     EQUAL,
     FACTOR_DIM,
@@ -366,8 +367,8 @@ class BaseExpression(ABC):
             data = assign_multiindex_safe(
                 data, vars=data.vars.fillna(-1).astype(DEFAULT_LABEL_DTYPE)
             )
-        if not np.issubdtype(data.coeffs, np.floating):
-            data["coeffs"].values = data.coeffs.values.astype(float)
+        if data.coeffs.dtype != DEFAULT_FLOAT_DTYPE:
+            data["coeffs"].values = data.coeffs.values.astype(DEFAULT_FLOAT_DTYPE)
 
         data = fill_missing_coords(data)
 
@@ -375,9 +376,11 @@ class BaseExpression(ABC):
             raise ValueError("data must contain one dimension ending with '_term'")
 
         if "const" not in data:
-            data = data.assign(const=0.0)
-        elif not np.issubdtype(data.const, np.floating):
-            data = assign_multiindex_safe(data, const=data.const.astype(float))
+            data = data.assign(const=np.float32(0.0))
+        elif data.const.dtype != DEFAULT_FLOAT_DTYPE:
+            data = assign_multiindex_safe(
+                data, const=data.const.astype(DEFAULT_FLOAT_DTYPE)
+            )
 
         (data,) = xr.broadcast(data, exclude=HELPER_DIMS)
         (coeffs_vars,) = xr.broadcast(data[["coeffs", "vars"]], exclude=[FACTOR_DIM])
@@ -1508,8 +1511,8 @@ class LinearExpression(BaseExpression):
                 # Return arrays filled with -1 and 0.0, same length as input
                 return np.vstack(
                     [
-                        np.full(input_len, -1, dtype=float),
-                        np.zeros(input_len, dtype=float),
+                        np.full(input_len, -1, dtype=DEFAULT_FLOAT_DTYPE),
+                        np.zeros(input_len, dtype=DEFAULT_FLOAT_DTYPE),
                     ]
                 )
 
@@ -1524,8 +1527,8 @@ class LinearExpression(BaseExpression):
             unique_coeffs = summed[unique_vars]
 
             # Pad to match input length
-            result_vars = np.full(input_len, -1, dtype=float)
-            result_coeffs = np.zeros(input_len, dtype=float)
+            result_vars = np.full(input_len, -1, dtype=DEFAULT_FLOAT_DTYPE)
+            result_coeffs = np.zeros(input_len, dtype=DEFAULT_FLOAT_DTYPE)
 
             n_unique = len(unique_vars)
             result_vars[:n_unique] = unique_vars

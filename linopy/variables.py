@@ -52,7 +52,7 @@ from linopy.common import (
     to_polars,
 )
 from linopy.config import options
-from linopy.constants import HELPER_DIMS, TERM_DIM
+from linopy.constants import DEFAULT_FLOAT_DTYPE, HELPER_DIMS, TERM_DIM
 from linopy.solver_capabilities import SolverFeature, solver_supports
 from linopy.types import (
     ConstantLike,
@@ -190,7 +190,7 @@ class Variable:
         for attr in ("lower", "upper"):
             # convert to float, important for  operations like "shift"
             if not issubdtype(data[attr].dtype, floating):
-                data[attr].values = data[attr].values.astype(float)
+                data[attr].values = data[attr].values.astype(DEFAULT_FLOAT_DTYPE)
 
         if "label_range" not in data.attrs:
             data.assign_attrs(label_range=(data.labels.min(), data.labels.max()))
