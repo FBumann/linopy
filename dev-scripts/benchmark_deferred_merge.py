@@ -35,62 +35,197 @@ from linopy import Model
 
 def build_dispatch_model(n_groups: int, n_plants: int, n_timesteps: int) -> Model:
     """
-    Build a dispatch model with independent regional subsystems.
+    Build a capacity expansion + dispatch model with independent regional
+    subsystems, each containing:
 
-    Each group represents an isolated region with its own buses/plants,
-    modeled over a local time horizon. The dimensions are COMPLETELY DISJOINT
-    across groups (each group has its own time and plant dimension).
+    - **Conventional generators**: dispatch + capacity variables, capacity
+      limits, ramping constraints, marginal costs.
+    - **Renewable generators**: dispatch limited by time-varying capacity
+      factors, zero marginal cost, investment cost for capacity.
+    - **Storage units**: charge / discharge / state-of-charge variables,
+      energy balance (SOC tracking), charge/discharge capacity limits,
+      cycling cost in objective.
+    - **Demand**: must be met per region per timestep.
 
-    The objective sums the cost expressions from all groups. On master,
-    chaining these additions creates a dense cross-product array of size
-    n_plants^n_groups × n_timesteps^n_groups (exponential). With
-    DeferredLinearExpression, parts are stored lazily.
+    All dimensions are COMPLETELY DISJOINT across regions (each region has
+    its own time and asset dimensions). The objective sums costs from all
+    regions and all component types.
+
+    On master, chaining these additions creates dense cross-product arrays.
+    With DeferredLinearExpression, parts are stored lazily.
 
     Parameters
     ----------
     n_groups : int
         Number of independent regional subsystems.
     n_plants : int
-        Plants per region (each gets its own dimension).
+        Conventional plants per region.
     n_timesteps : int
-        Time steps per region (each gets its own dimension).
+        Time steps per region.
     """
     m = Model()
 
+    n_renewables = max(1, n_plants // 3)
+    n_storage = max(1, n_plants // 5)
+
     cost_parts = []
 
-    for t in range(n_groups):
-        time_idx = pd.RangeIndex(n_timesteps, name=f"time_{t}")
-        plants = pd.Index([f"g{t}_p{p}" for p in range(n_plants)], name=f"plant_{t}")
+    for g in range(n_groups):
+        time_idx = pd.RangeIndex(n_timesteps, name=f"time_{g}")
+        plants = pd.Index([f"g{g}_p{p}" for p in range(n_plants)], name=f"plant_{g}")
+        renew = pd.Index([f"g{g}_r{r}" for r in range(n_renewables)], name=f"renew_{g}")
+        stor = pd.Index([f"g{g}_s{s}" for s in range(n_storage)], name=f"stor_{g}")
 
-        gen = m.add_variables(lower=0, coords=[time_idx, plants], name=f"gen_{t}")
-        cap = m.add_variables(lower=0, coords=[plants], name=f"cap_{t}")
+        # ── Conventional generators ──
+        gen = m.add_variables(lower=0, coords=[time_idx, plants], name=f"gen_{g}")
+        gen_cap = m.add_variables(lower=0, coords=[plants], name=f"gen_cap_{g}")
 
-        # Capacity constraint (same-shape — no cross-product issue)
-        m.add_constraints(gen - cap, "<=", 0, name=f"cap_limit_{t}")
+        # Capacity limit
+        m.add_constraints(gen - gen_cap, "<=", 0, name=f"gen_cap_limit_{g}")
 
-        # Demand constraint per region
-        demand = pd.Series(np.full(n_timesteps, 100.0), index=time_idx)
-        m.add_constraints(gen.sum(f"plant_{t}"), ">=", demand, name=f"demand_{t}")
+        # Ramping constraint: |gen(t) - gen(t-1)| <= 0.3 * cap
+        # Approximate with two one-sided constraints
+        gen_diff = gen.diff(f"time_{g}")
+        ramp_limit = 0.3 * gen_cap
+        m.add_constraints(gen_diff - ramp_limit, "<=", 0, name=f"ramp_up_{g}")
+        m.add_constraints(-gen_diff - ramp_limit, "<=", 0, name=f"ramp_dn_{g}")
 
-        # Marginal cost per plant
-        mc = pd.Series(
-            10.0 + t * 5.0 + np.arange(n_plants, dtype=float),
-            index=plants,
-        )
+        # Marginal cost
+        mc = pd.Series(10.0 + g * 5.0 + np.arange(n_plants, dtype=float), index=plants)
         cost_parts.append(gen * mc)
 
-    # ── Objective: sum of cost across all regions ──
-    # Chaining += on expressions with fully disjoint dims.
-    # On master: each += calls merge() with join="outer" → exponential blowup.
-    # On feature: DeferredLinearExpression stores parts lazily.
+        # Investment cost for capacity
+        inv_cost_gen = pd.Series(
+            100.0 + np.arange(n_plants, dtype=float) * 10, index=plants
+        )
+        cost_parts.append(gen_cap * inv_cost_gen)
+
+        # ── Renewables ──
+        ren_gen = m.add_variables(lower=0, coords=[time_idx, renew], name=f"ren_{g}")
+        ren_cap = m.add_variables(lower=0, coords=[renew], name=f"ren_cap_{g}")
+
+        # Time-varying capacity factor (e.g. solar/wind profile)
+        rng = np.random.default_rng(g * 100)
+        cf = pd.DataFrame(
+            rng.uniform(0.1, 0.9, (n_timesteps, n_renewables)),
+            index=time_idx,
+            columns=renew,
+        )
+        m.add_constraints(ren_gen - ren_cap * cf, "<=", 0, name=f"ren_cf_{g}")
+
+        # Renewable investment cost (zero marginal cost)
+        inv_cost_ren = pd.Series(
+            200.0 + np.arange(n_renewables, dtype=float) * 20, index=renew
+        )
+        cost_parts.append(ren_cap * inv_cost_ren)
+
+        # ── Storage ──
+        charge = m.add_variables(lower=0, coords=[time_idx, stor], name=f"charge_{g}")
+        discharge = m.add_variables(
+            lower=0, coords=[time_idx, stor], name=f"discharge_{g}"
+        )
+        soc = m.add_variables(lower=0, coords=[time_idx, stor], name=f"soc_{g}")
+        stor_cap = m.add_variables(lower=0, coords=[stor], name=f"stor_cap_{g}")
+
+        # Charge / discharge capacity limits
+        m.add_constraints(charge - 0.5 * stor_cap, "<=", 0, name=f"charge_lim_{g}")
+        m.add_constraints(
+            discharge - 0.5 * stor_cap, "<=", 0, name=f"discharge_lim_{g}"
+        )
+
+        # SOC capacity limit
+        m.add_constraints(soc - stor_cap, "<=", 0, name=f"soc_lim_{g}")
+
+        # Energy balance: soc(t) = soc(t-1) + 0.95*charge(t) - discharge(t)
+        soc_prev = soc.shift({f"time_{g}": 1})
+        m.add_constraints(
+            soc - soc_prev - 0.95 * charge + discharge,
+            "=",
+            0,
+            name=f"soc_balance_{g}",
+        )
+
+        # Storage cycling cost (small penalty for throughput)
+        cost_parts.append(0.5 * charge + 0.5 * discharge)
+
+        # Storage investment cost
+        inv_cost_stor = pd.Series(
+            150.0 + np.arange(n_storage, dtype=float) * 15, index=stor
+        )
+        cost_parts.append(stor_cap * inv_cost_stor)
+
+        # ── Demand balance ──
+        demand = pd.Series(np.full(n_timesteps, 100.0), index=time_idx)
+        supply = (
+            gen.sum(f"plant_{g}")
+            + ren_gen.sum(f"renew_{g}")
+            + discharge.sum(f"stor_{g}")
+            - charge.sum(f"stor_{g}")
+        )
+        m.add_constraints(supply, ">=", demand, name=f"demand_{g}")
+
+    # ── Objective: sum of all cost components across all regions ──
     total_cost = cost_parts[0]
     for c in cost_parts[1:]:
         total_cost = total_cost + c
     m.add_objective(total_cost)
 
-    # Write LP file — this is what solve() does for file-based solvers.
-    # Ensures we measure the full pipeline including any deferred materialization.
+    # Write LP file — full pipeline including any deferred materialization.
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".lp", delete=True) as f:
+        m.to_file(f.name)
+
+    return m
+
+
+def build_shared_time_model(
+    n_components: int, n_assets: int, n_timesteps: int
+) -> Model:
+    """
+    Build a model where ALL components share the same time dimension.
+
+    This is the case where DeferredLinearExpression CANNOT help — all
+    expressions share the "time" dimension, so additions produce same-shape
+    merges (no deferral) or overlapping deferred that must materialize.
+
+    This benchmark verifies there is no performance regression on models
+    that don't benefit from deferral.
+
+    Parameters
+    ----------
+    n_components : int
+        Number of different asset types (generators, storage, etc.)
+    n_assets : int
+        Assets per component type (each type gets its own asset dimension,
+        but ALL share the same time dimension).
+    n_timesteps : int
+        Shared time steps across all components.
+    """
+    m = Model()
+
+    time_idx = pd.RangeIndex(n_timesteps, name="time")  # SHARED across all
+
+    cost_parts = []
+
+    for c in range(n_components):
+        assets = pd.Index([f"c{c}_a{a}" for a in range(n_assets)], name=f"asset_{c}")
+
+        gen = m.add_variables(lower=0, coords=[time_idx, assets], name=f"gen_{c}")
+        cap = m.add_variables(lower=0, coords=[assets], name=f"cap_{c}")
+
+        m.add_constraints(gen - cap, "<=", 0, name=f"cap_limit_{c}")
+
+        mc = pd.Series(10.0 + c * 5.0 + np.arange(n_assets, dtype=float), index=assets)
+        cost_parts.append(gen * mc)
+
+    # Objective: sum costs across all components (shared time dim)
+    total_gen = cost_parts[0]
+    for c in cost_parts[1:]:
+        total_gen = total_gen + c
+
+    m.add_objective(total_gen)
+
     import tempfile
 
     with tempfile.NamedTemporaryFile(suffix=".lp", delete=True) as f:
@@ -127,19 +262,16 @@ def measure(func, warmup: int = 1, repeats: int = 5):
     }
 
 
-def run_benchmarks() -> list[dict]:
+def run_disjoint_benchmarks() -> list[dict]:
+    """Benchmark: disjoint regional subsystems (deferred helps)."""
     results = []
 
-    # Scenarios grouped by n_groups, sweeping n_plants with fixed n_timesteps.
-    # This gives clean scaling curves per group count.
-    # Cross-product size = (n_timesteps * n_plants)^n_groups
     scenarios = [
         # 2 groups, T=10, sweep P
         (2, 5, 10),
         (2, 10, 10),
         (2, 20, 10),
         (2, 50, 10),
-        (2, 100, 10),
         # 3 groups, T=10, sweep P
         (3, 5, 10),
         (3, 10, 10),
@@ -159,8 +291,7 @@ def run_benchmarks() -> list[dict]:
 
     for n_groups, n_plants, n_ts in scenarios:
         cross_size = (n_ts * n_plants) ** n_groups
-        # Skip if cross-product would exceed ~8GB (to avoid OOM on master)
-        est_bytes = cross_size * 8 * 2  # coeffs + vars arrays
+        est_bytes = cross_size * 8 * 2
         if est_bytes > 8e9:
             print(
                 f"  SKIP  G={n_groups} P={n_plants:>3d} T={n_ts:>3d}  "
@@ -206,47 +337,90 @@ def run_benchmarks() -> list[dict]:
     return results
 
 
-def plot_comparison(file_a: str, file_b: str) -> None:
-    import matplotlib.pyplot as plt
+def run_shared_benchmarks() -> list[dict]:
+    """Benchmark: shared time dimension (deferred does NOT help)."""
+    results = []
 
-    with open(file_a) as f:
-        data_a = json.load(f)
-    with open(file_b) as f:
-        data_b = json.load(f)
+    # (n_components, n_assets, n_timesteps)
+    # All components share "time" — additions are same-shape or overlapping.
+    # Each component has its own asset dim but shares "time", so the
+    # additions create DeferredLinearExpressions that must materialize
+    # (overlapping "time" dim). No benefit expected from deferral.
+    scenarios = [
+        (2, 10, 50),
+        (2, 50, 50),
+        (2, 100, 50),
+        (2, 200, 50),
+        (3, 10, 50),
+        (3, 50, 50),
+        (3, 100, 50),
+        (5, 10, 50),
+        (5, 50, 50),
+        (5, 100, 50),
+    ]
 
-    label_a = data_a.get("label", Path(file_a).stem)
-    label_b = data_b.get("label", Path(file_b).stem)
+    for n_comp, n_assets, n_ts in scenarios:
+        stats = measure(
+            lambda nc=n_comp, na=n_assets, nt=n_ts: build_shared_time_model(nc, na, nt),
+            warmup=1,
+            repeats=5,
+        )
 
-    # Group results by n_groups
-    def by_groups(data):
-        out: dict[int, list[dict]] = {}
-        for r in data["results"]:
-            if r.get("skipped"):
-                continue
-            out.setdefault(r["n_groups"], []).append(r)
-        # Sort each group by n_plants for a clean curve
-        for g in out:
-            out[g].sort(key=lambda x: x["n_plants"])
-        return out
+        print(
+            f"  C={n_comp} A={n_assets:>4d} T={n_ts:>3d}  "
+            f"time={stats['time_median_s'] * 1000:>8.1f} ms  "
+            f"peak={stats['peak_mb_median']:>8.1f} MB"
+        )
 
-    groups_a = by_groups(data_a)
-    groups_b = by_groups(data_b)
-    all_g = sorted(set(groups_a) | set(groups_b))
+        results.append(
+            {
+                "n_components": n_comp,
+                "n_assets": n_assets,
+                "n_timesteps": n_ts,
+                "skipped": False,
+                **stats,
+            }
+        )
 
-    fig, axes = plt.subplots(len(all_g), 2, figsize=(12, 4 * len(all_g)), squeeze=False)
-    fig.suptitle(
-        f"Deferred Merge Benchmark: {label_a} vs {label_b}", fontsize=14, y=1.01
-    )
+    return results
 
+
+def _plot_grouped_rows(
+    axes,
+    data_a,
+    data_b,
+    label_a,
+    label_b,
+    group_key,
+    x_key,
+    x_label,
+    title_fn,
+    start_row=0,
+):
+    """Plot rows of time/memory subplots grouped by `group_key`, swept by `x_key`."""
     c1, c2 = "#1f77b4", "#ff7f0e"
 
-    for row, g in enumerate(all_g):
+    def by_group(data, key):
+        out: dict[int, list[dict]] = {}
+        for r in data:
+            if r.get("skipped"):
+                continue
+            out.setdefault(r[key], []).append(r)
+        for g in out:
+            out[g].sort(key=lambda x: x[x_key])
+        return out
+
+    groups_a = by_group(data_a, group_key)
+    groups_b = by_group(data_b, group_key)
+    all_g = sorted(set(groups_a) | set(groups_b))
+
+    for i, g in enumerate(all_g):
+        row = start_row + i
         ra = groups_a.get(g, [])
         rb = groups_b.get(g, [])
 
-        # x-axis: n_plants (the swept variable)
-        xa = [r["n_plants"] for r in ra]
-        xb = [r["n_plants"] for r in rb]
+        xa = [r[x_key] for r in ra]
+        xb = [r[x_key] for r in rb]
 
         # Time plot
         ax = axes[row][0]
@@ -262,11 +436,10 @@ def plot_comparison(file_a: str, file_b: str) -> None:
             tq75b = [r["time_q75_s"] * 1000 for r in rb]
             ax.fill_between(xb, tq25b, tq75b, color=c2, alpha=0.15)
             ax.plot(xb, tb, "s-", color=c2, label=label_b, alpha=0.8)
-        ax.set_xlabel("Plants per group")
+        ax.set_xlabel(x_label)
         ax.set_ylabel("Build time (ms)")
-        n_ts = ra[0]["n_timesteps"] if ra else (rb[0]["n_timesteps"] if rb else "?")
         ax.set_ylim(bottom=0)
-        ax.set_title(f"{g} groups, T={n_ts}")
+        ax.set_title(title_fn(g, ra or rb))
         ax.legend()
         ax.grid(True, alpha=0.3)
 
@@ -278,12 +451,77 @@ def plot_comparison(file_a: str, file_b: str) -> None:
         if rb:
             mb = [r["peak_mb_median"] for r in rb]
             ax.plot(xb, mb, "s-", color=c2, label=label_b, alpha=0.8)
-        ax.set_xlabel("Plants per group")
+        ax.set_xlabel(x_label)
         ax.set_ylabel("Peak memory (MB)")
         ax.set_ylim(bottom=0)
-        ax.set_title(f"{g} groups, T={n_ts}")
+        ax.set_title(title_fn(g, ra or rb))
         ax.legend()
         ax.grid(True, alpha=0.3)
+
+    return len(all_g)
+
+
+def plot_comparison(file_a: str, file_b: str) -> None:
+    import matplotlib.pyplot as plt
+
+    with open(file_a) as f:
+        data_a = json.load(f)
+    with open(file_b) as f:
+        data_b = json.load(f)
+
+    label_a = data_a.get("label", Path(file_a).stem)
+    label_b = data_b.get("label", Path(file_b).stem)
+
+    disjoint_a = data_a.get("disjoint", [])
+    disjoint_b = data_b.get("disjoint", [])
+    shared_a = data_a.get("shared", [])
+    shared_b = data_b.get("shared", [])
+
+    # Count rows needed
+    disjoint_groups = {
+        r["n_groups"] for r in disjoint_a + disjoint_b if not r.get("skipped")
+    }
+    shared_groups = {
+        r["n_components"] for r in shared_a + shared_b if not r.get("skipped")
+    }
+    n_rows = len(disjoint_groups) + len(shared_groups)
+
+    if n_rows == 0:
+        print("No data to plot.")
+        return
+
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 4 * n_rows), squeeze=False)
+    fig.suptitle(
+        f"Deferred Merge Benchmark: {label_a} vs {label_b}", fontsize=14, y=1.01
+    )
+
+    rows_used = _plot_grouped_rows(
+        axes,
+        disjoint_a,
+        disjoint_b,
+        label_a,
+        label_b,
+        group_key="n_groups",
+        x_key="n_plants",
+        x_label="Plants per region",
+        title_fn=lambda g,
+        rs: f"Disjoint regions: {g} groups, T={rs[0]['n_timesteps']}",
+        start_row=0,
+    )
+
+    _plot_grouped_rows(
+        axes,
+        shared_a,
+        shared_b,
+        label_a,
+        label_b,
+        group_key="n_components",
+        x_key="n_assets",
+        x_label="Assets per component",
+        title_fn=lambda g,
+        rs: f"Shared time (no benefit): {g} components, T={rs[0]['n_timesteps']}",
+        start_row=rows_used,
+    )
 
     plt.tight_layout()
     out = "dev-scripts/benchmark_deferred_merge.png"
@@ -315,13 +553,21 @@ def main() -> None:
         ).strip()
     )
 
+    # ── Disjoint benchmarks ──
     print(f"Deferred merge benchmark (label={label!r})")
-    print("  G=groups  P=plants/group  T=timesteps")
-    print("  cross = (T × P)^G  (dense array size on master)")
     print("=" * 80)
+    print("\n[1/2] Disjoint regions (deferred helps)")
+    print("  G=groups  P=plants/group  T=timesteps")
+    print("-" * 80)
+    disjoint = run_disjoint_benchmarks()
 
-    results = run_benchmarks()
-    output = {"label": label, "results": results}
+    # ── Shared benchmarks ──
+    print("\n[2/2] Shared time dimension (no benefit expected)")
+    print("  C=components  A=assets/component  T=timesteps")
+    print("-" * 80)
+    shared = run_shared_benchmarks()
+
+    output = {"label": label, "disjoint": disjoint, "shared": shared}
 
     if args.output:
         with open(args.output, "w") as f:
