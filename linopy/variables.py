@@ -188,8 +188,8 @@ class Variable:
         if not skip_broadcast:
             (data,) = broadcast(data)
         for attr in ("lower", "upper"):
-            # convert to float, important for  operations like "shift"
-            if not issubdtype(data[attr].dtype, floating):
+            # convert to float32, important for operations like "shift"
+            if data[attr].dtype != DEFAULT_FLOAT_DTYPE:
                 data[attr].values = data[attr].values.astype(DEFAULT_FLOAT_DTYPE)
 
         if "label_range" not in data.attrs:
