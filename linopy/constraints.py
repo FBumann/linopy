@@ -147,7 +147,7 @@ class Constraint:
         self._model = model
         self._lazy_parts = lazy_parts
         self._name = name
-        self._label_range = None
+        self._label_range: tuple[int, int] | None = None
 
         if lazy_parts is not None:
             # Defer materialization — _data computed on first .data access
@@ -188,7 +188,7 @@ class Constraint:
         Get the attributes of the constraint.
         """
         if self._data is None and self._lazy_parts:
-            attrs = {"name": self._name}
+            attrs: dict[str, Any] = {"name": self._name}
             if self._label_range is not None:
                 attrs["label_range"] = self._label_range
             return attrs
@@ -261,6 +261,7 @@ class Constraint:
         """
         if self._data is None and self._lazy_parts:
             self._materialize_from_parts()
+        assert self._data is not None
         return self._data
 
     def _materialize_from_parts(self) -> None:
@@ -268,9 +269,11 @@ class Constraint:
         from linopy.common import check_common_keys_values
         from linopy.constants import HELPER_DIMS
 
-        coord_dims = [
-            {k: v for k, v in p.sizes.items() if k not in HELPER_DIMS}
-            for p in self._lazy_parts
+        assert self._lazy_parts is not None
+        parts = self._lazy_parts
+        coord_dims: list[dict[str, int]] = [
+            {str(k): v for k, v in p.sizes.items() if k not in HELPER_DIMS}
+            for p in parts
         ]
         override = check_common_keys_values(coord_dims)
         kwargs = {
@@ -279,14 +282,14 @@ class Constraint:
             "fill_value": FILL_VALUE,
             "join": "override" if override else "outer",
         }
-        ds = xr.concat(self._lazy_parts, TERM_DIM, **kwargs)
+        ds = xr.concat(parts, TERM_DIM, **kwargs)  # type: ignore[call-overload]
         for d in set(HELPER_DIMS) & set(ds.coords):
             ds = ds.reset_index(d, drop=True)
         (ds,) = xr.broadcast(ds, exclude=[TERM_DIM])
-        attrs = {"name": self._name}
+        mat_attrs: dict[str, Any] = {"name": self._name}
         if self._label_range is not None:
-            attrs["label_range"] = self._label_range
-        ds = ds.assign_attrs(**attrs)
+            mat_attrs["label_range"] = self._label_range
+        ds = ds.assign_attrs(**mat_attrs)
         self._data = ds
         self._assigned = "labels" in ds
         self._lazy_parts = None  # clear parts after materialization
@@ -667,6 +670,7 @@ class Constraint:
                 mask &= data["labels"] != -1
             return mask
 
+        assert self._lazy_parts is not None
         frames = []
         for part in self._lazy_parts:
             df = to_dataframe(part, mask_func=mask_func)
@@ -728,6 +732,7 @@ class Constraint:
 
     def _to_polars_from_parts(self) -> pl.DataFrame:
         """Convert lazy constraint parts to polars DataFrame per-part."""
+        assert self._lazy_parts is not None
         frames = []
         for part in self._lazy_parts:
             keys = [k for k in part if ("_term" in part[k].dims) or (k == "labels")]

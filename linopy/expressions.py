@@ -1798,7 +1798,7 @@ class LazyLinearExpression(LinearExpression):
         # Normal LinearExpression construction (e.g. from exprwrap fallback)
         if parts is None and not isinstance(data_or_parts, list):
             super().__init__(data_or_parts, model)
-            self._parts = []
+            self._parts: list[Dataset] = []
             self._const_override = None
             return
 
@@ -1862,7 +1862,7 @@ class LazyLinearExpression(LinearExpression):
             {k: v for k, v in p.sizes.items() if k not in HELPER_DIMS}
             for p in self._parts
         ]
-        override = check_common_keys_values(coord_dims)
+        override = check_common_keys_values(coord_dims)  # type: ignore[arg-type]
 
         kwargs: dict[str, Any] = {
             "coords": "minimal",
@@ -1919,7 +1919,7 @@ class LazyLinearExpression(LinearExpression):
         check_has_nulls(df, name=self.type)
         return df
 
-    def __add__(
+    def __add__(  # type: ignore[override]
         self,
         other: ConstantLike
         | VariableLike
@@ -1976,7 +1976,7 @@ class LazyLinearExpression(LinearExpression):
         except TypeError:
             return NotImplemented
 
-    def __neg__(self) -> LinearExpression:
+    def __neg__(self) -> LinearExpression:  # type: ignore[override]
         if not self.is_lazy:
             return super().__neg__()
         neg_parts = [assign_multiindex_safe(p, coeffs=-p.coeffs) for p in self._parts]
@@ -1992,7 +1992,7 @@ class LazyLinearExpression(LinearExpression):
             const=-const,
         )
 
-    def __sub__(
+    def __sub__(  # type: ignore[override]
         self,
         other: ConstantLike
         | VariableLike
@@ -2172,7 +2172,7 @@ class LazyLinearExpression(LinearExpression):
         # Materialize — shift fill behavior needs consistent coord space
         return LinearExpression.shift(self, *args, **kwargs)
 
-    def diff(self, dim: str, n: int = 1) -> LazyLinearExpression | LinearExpression:
+    def diff(self, dim: str, n: int = 1) -> LazyLinearExpression | LinearExpression:  # type: ignore[override]
         """Apply diff to each part that contains the dimension."""
         if not self.is_lazy:
             return super().diff(dim, n)
@@ -2540,18 +2540,16 @@ def merge(
     else:
         override = False
 
-    data = [
+    data_list: list[Dataset] = [
         e.data
         if isinstance(e, linopy_types)
         and not (isinstance(e, LazyLinearExpression) and e.is_lazy)
-        else e
+        else e  # type: ignore[misc]
         for e in exprs
     ]
-    data = [
-        fill_missing_coords(ds, fill_helper_dims=True)
-        if isinstance(ds, Dataset)
-        else ds
-        for ds in data
+    data_list = [
+        fill_missing_coords(d, fill_helper_dims=True) if isinstance(d, Dataset) else d
+        for d in data_list
     ]
 
     if not kwargs:
@@ -2592,17 +2590,13 @@ def merge(
 
             # Sum constants — skip zero-valued arrays to avoid creating
             # a Cartesian product from disjoint dimensions.
-            nonzero_consts = [
-                c
-                for c in const_arrays
-                if not (
-                    isinstance(c.values, np.ndarray)
-                    and c.size > 1
-                    and (c.values == 0).all()
-                    or c.size <= 1
-                    and float(c) == 0.0
-                )
-            ]
+            def _is_all_zero(c: DataArray) -> bool:
+                vals = c.values
+                if isinstance(vals, np.ndarray):
+                    return bool((vals == 0).all())
+                return float(vals) == 0.0
+
+            nonzero_consts = [c for c in const_arrays if not _is_all_zero(c)]
             if not nonzero_consts:
                 const: DataArray = xr.DataArray(0.0)
             else:
@@ -2611,27 +2605,33 @@ def merge(
                     const, c = xr.align(const, c, join="outer", fill_value=0)
                     const = const + c
 
-            return LazyLinearExpression(
+            return LazyLinearExpression(  # type: ignore[return-value]
                 None,  # type: ignore[arg-type]
                 model,
                 parts=parts,
                 const=const,
             )
 
-        ds = xr.concat([d[["coeffs", "vars"]] for d in data], dim, **kwargs)
+        ds = xr.concat([d[["coeffs", "vars"]] for d in data_list], dim, **kwargs)
         subkwargs = {**kwargs, "fill_value": 0}
-        const = xr.concat([d["const"] for d in data], dim, **subkwargs).sum(TERM_DIM)
+        const = xr.concat([d["const"] for d in data_list], dim, **subkwargs).sum(
+            TERM_DIM
+        )
         ds = assign_multiindex_safe(ds, const=const)
     elif dim == FACTOR_DIM:
-        ds = xr.concat([d[["vars"]] for d in data], dim, **kwargs)
-        coeffs = xr.concat([d["coeffs"] for d in data], dim, **kwargs).prod(FACTOR_DIM)
-        const = xr.concat([d["const"] for d in data], dim, **kwargs).prod(FACTOR_DIM)
+        ds = xr.concat([d[["vars"]] for d in data_list], dim, **kwargs)
+        coeffs = xr.concat([d["coeffs"] for d in data_list], dim, **kwargs).prod(
+            FACTOR_DIM
+        )
+        const = xr.concat([d["const"] for d in data_list], dim, **kwargs).prod(
+            FACTOR_DIM
+        )
         ds = assign_multiindex_safe(ds, coeffs=coeffs, const=const)
     else:
-        ds = xr.concat(data, dim, **kwargs)
+        ds = xr.concat(data_list, dim, **kwargs)
 
-    for d in set(HELPER_DIMS) & set(ds.coords):
-        ds = ds.reset_index(d, drop=True)
+    for dim_name in set(HELPER_DIMS) & set(ds.coords):
+        ds = ds.reset_index(dim_name, drop=True)
 
     return cls(ds, model)
 
