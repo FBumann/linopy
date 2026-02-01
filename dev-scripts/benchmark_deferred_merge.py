@@ -15,6 +15,32 @@ Usage:
 
     # Plot comparison:
     python dev-scripts/benchmark_deferred_merge.py --plot master.json deferred.json
+
+Results (2026-02-01, Apple Silicon):
+
+    Disjoint regions — each group has dims (time_g, plant_g), fully disjoint
+    across groups. On master, adding expressions across groups triggers
+    xr.concat(join="outer"), creating a dense array of size (T*P)^G.
+    With DeferredLinearExpression, parts stay lazy and are summed per-part
+    in the objective setter (since _has_disjoint_dims() returns True).
+
+      master:   memory scales with cross-product size, up to ~930 MB
+                at G=3 P=20 T=10 (cross=8M). Time grows from ~190ms to ~540ms.
+      deferred: memory stays flat at <0.5 MB regardless of scenario size.
+                Time stays flat at ~175ms (G=2) to ~430ms (G=5), scaling
+                only with the number of groups (sequential model building),
+                not with the cross-product.
+
+    Shared dims — all components use the same (time, asset) coordinates.
+    Additions are same-shape, so no DeferredLinearExpression is created.
+
+      Both branches perform identically (no regression).
+
+    Key limitation: if parts within a deferred expression share any
+    coordinate dimension (e.g. time_g appears in both gen*mc and
+    charge*cost for the same group), _has_disjoint_dims() returns False
+    and the expression materializes on both branches. The optimization
+    only applies when ALL dims across ALL parts are disjoint.
 """
 
 from __future__ import annotations
