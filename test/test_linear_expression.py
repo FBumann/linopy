@@ -527,10 +527,10 @@ def test_linear_expression_multiplication(
     assert (mexpr.coeffs.sel(dim_1=0, dim_0=0, _term=0) == 100).item()
 
     mexpr = expr / 100
-    assert (mexpr.coeffs.sel(dim_1=0, dim_0=0, _term=0) == 1 / 10).item()
+    assert mexpr.coeffs.sel(dim_1=0, dim_0=0, _term=0).item() == pytest.approx(1 / 10)
 
     mexpr = expr / 100.0
-    assert (mexpr.coeffs.sel(dim_1=0, dim_0=0, _term=0) == 1 / 10).item()
+    assert mexpr.coeffs.sel(dim_1=0, dim_0=0, _term=0).item() == pytest.approx(1 / 10)
 
 
 def test_matmul_variable_and_const(x: Variable, y: Variable) -> None:
