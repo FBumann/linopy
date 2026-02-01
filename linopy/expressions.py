@@ -1099,36 +1099,43 @@ class BaseExpression(ABC):
 
     def densify_terms(self: GenericExpression) -> GenericExpression:
         """
-        Move all non-zero term entries to the front and cut off all-zero
+        Move all active term entries to the front and cut off dead
         entries in the term-axis.
+
+        A term is considered active if its variable label is not -1
+        (masked/missing) and its coefficient is not 0.
         """
         data = self.data.transpose(..., TERM_DIM)
 
+        vdata = data.vars.data
         cdata = data.coeffs.data
         axis = cdata.ndim - 1
-        nnz = np.nonzero(cdata)
-        nterm_per_cell = (cdata != 0).sum(axis)
+
+        # A term is alive if it has a valid variable AND nonzero coefficient
+        alive = (vdata != -1) & (cdata != 0)
+        nterm_per_cell = alive.sum(axis)
         if nterm_per_cell.size == 0 or nterm_per_cell.max() == 0:
             return self.__class__(data.sel({TERM_DIM: slice(0, 1)}), self.model)
-        nterm = nterm_per_cell.max()
+        nterm = int(nterm_per_cell.max())
 
         # Nothing to compact if all term slots are already used
         if nterm == cdata.shape[axis]:
             return self
 
+        nnz = np.nonzero(alive)
         mod_nnz = list(nnz)
         mod_nnz.pop(axis)
 
         if not mod_nnz:
-            # Scalar case (only _term dimension): all nonzeros map to positions 0,1,2,...
+            # Scalar case (only _term dimension)
             new_index = np.arange(len(nnz[0]))
             mod_nnz.insert(axis, new_index)
-            vdata = np.full_like(cdata, -1)
-            vdata[tuple(mod_nnz)] = data.vars.data[nnz]
-            data.vars.data = vdata
-            cdata_new = np.zeros_like(cdata)
-            cdata_new[tuple(mod_nnz)] = data.coeffs.data[nnz]
-            data.coeffs.data = cdata_new
+            new_vdata = np.full_like(vdata, -1)
+            new_vdata[tuple(mod_nnz)] = vdata[nnz]
+            data.vars.data = new_vdata
+            new_cdata = np.zeros_like(cdata)
+            new_cdata[tuple(mod_nnz)] = cdata[nnz]
+            data.coeffs.data = new_cdata
             return self.__class__(data.sel({TERM_DIM: slice(0, nterm)}), self.model)
 
         remaining_axes = np.vstack(mod_nnz).T
@@ -1145,13 +1152,13 @@ class BaseExpression(ABC):
         new_index[order] = group_pos
         mod_nnz.insert(axis, new_index)
 
-        vdata = np.full_like(cdata, -1)
-        vdata[tuple(mod_nnz)] = data.vars.data[nnz]
-        data.vars.data = vdata
+        new_vdata = np.full_like(vdata, -1)
+        new_vdata[tuple(mod_nnz)] = vdata[nnz]
+        data.vars.data = new_vdata
 
-        cdata = np.zeros_like(cdata)
-        cdata[tuple(mod_nnz)] = data.coeffs.data[nnz]
-        data.coeffs.data = cdata
+        new_cdata = np.zeros_like(cdata)
+        new_cdata[tuple(mod_nnz)] = cdata[nnz]
+        data.coeffs.data = new_cdata
 
         return self.__class__(data.sel({TERM_DIM: slice(0, nterm)}), self.model)
 
