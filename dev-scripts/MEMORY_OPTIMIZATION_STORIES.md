@@ -34,6 +34,8 @@ print((expr.data.vars.values == -1).mean())       # ~90% dead
 **Hypothesis**: `_term` should only contain the ~30 active contributors per
 effect, not all 300. The 90% dead terms waste memory in every downstream op.
 
+**Profiling**: See `dev-scripts/story1_profile.md` for detailed scalene/tracemalloc results.
+
 ---
 
 ## Story 2: Cartesian Product from Disjoint Dimensions
