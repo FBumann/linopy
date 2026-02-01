@@ -1114,8 +1114,16 @@ class BaseExpression(ABC):
 
         remaining_axes = np.vstack(mod_nnz).T
         _, idx_ = np.unique(remaining_axes, axis=0, return_inverse=True)
-        idx = list(idx_)
-        new_index = np.array([idx[:i].count(j) for i, j in enumerate(idx)])
+        # Vectorized cumulative count within groups (O(n log n) vs O(n²))
+        order = np.argsort(idx_, kind="mergesort")
+        sorted_idx = idx_[order]
+        group_pos = np.ones(len(sorted_idx), dtype=np.intp)
+        group_pos[0] = 0
+        group_pos[1:] = (sorted_idx[1:] != sorted_idx[:-1]).astype(np.intp)
+        np.cumsum(group_pos, out=group_pos)
+        group_pos -= group_pos[np.searchsorted(sorted_idx, sorted_idx, side="left")]
+        new_index = np.empty_like(group_pos)
+        new_index[order] = group_pos
         mod_nnz.insert(axis, new_index)
 
         vdata = np.full_like(cdata, -1)
