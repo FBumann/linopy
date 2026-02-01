@@ -34,10 +34,16 @@ def test_constraint_assignment() -> None:
         assert "con0" in getattr(m.constraints, attr)
 
     assert m.constraints.labels.con0.shape == (10, 10)
-    assert m.constraints.labels.con0.dtype == int
-    assert m.constraints.coeffs.con0.dtype in (int, float)
-    assert m.constraints.vars.con0.dtype in (int, float)
-    assert m.constraints.rhs.con0.dtype in (int, float)
+    assert np.issubdtype(m.constraints.labels.con0.dtype, np.integer)
+    assert np.issubdtype(m.constraints.coeffs.con0.dtype, np.floating) or np.issubdtype(
+        m.constraints.coeffs.con0.dtype, np.integer
+    )
+    assert np.issubdtype(m.constraints.vars.con0.dtype, np.integer) or np.issubdtype(
+        m.constraints.vars.con0.dtype, np.floating
+    )
+    assert np.issubdtype(m.constraints.rhs.con0.dtype, np.floating) or np.issubdtype(
+        m.constraints.rhs.con0.dtype, np.integer
+    )
 
     assert_conequal(m.constraints.con0, con0)
 
@@ -88,10 +94,16 @@ def test_anonymous_constraint_assignment() -> None:
         assert "con0" in getattr(m.constraints, attr)
 
     assert m.constraints.labels.con0.shape == (10, 10)
-    assert m.constraints.labels.con0.dtype == int
-    assert m.constraints.coeffs.con0.dtype in (int, float)
-    assert m.constraints.vars.con0.dtype in (int, float)
-    assert m.constraints.rhs.con0.dtype in (int, float)
+    assert np.issubdtype(m.constraints.labels.con0.dtype, np.integer)
+    assert np.issubdtype(m.constraints.coeffs.con0.dtype, np.floating) or np.issubdtype(
+        m.constraints.coeffs.con0.dtype, np.integer
+    )
+    assert np.issubdtype(m.constraints.vars.con0.dtype, np.integer) or np.issubdtype(
+        m.constraints.vars.con0.dtype, np.floating
+    )
+    assert np.issubdtype(m.constraints.rhs.con0.dtype, np.floating) or np.issubdtype(
+        m.constraints.rhs.con0.dtype, np.integer
+    )
 
 
 def test_constraint_assignment_with_tuples() -> None:
