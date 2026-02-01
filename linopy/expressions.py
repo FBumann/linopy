@@ -2493,35 +2493,30 @@ class DeferredLinearExpression:
     @property
     def flat(self) -> pd.DataFrame:
         """
-        Return flat DataFrame.
+        Return flat DataFrame by concatenating each part's flat output.
 
-        When parts have disjoint dimensions, concatenates each part's flat
-        output directly (no cross-product). Otherwise materializes first
-        to ensure correct broadcasting.
+        This always works without materialization because flat output is just
+        (var_id, coeff) pairs — var IDs are globally unique, so shared
+        dimensions don't affect correctness. The groupby("vars").sum()
+        combines any duplicate var references across parts.
         """
-        if self._has_disjoint_dims():
-            dfs = [p.flat for p in self._parts]
-            df = pd.concat(dfs, ignore_index=True)
-            df = df.groupby("vars", as_index=False).sum()
-            check_has_nulls(df, name="DeferredLinearExpression")
-            return df
-        return self.materialize().flat
+        dfs = [p.flat for p in self._parts]
+        df = pd.concat(dfs, ignore_index=True)
+        df = df.groupby("vars", as_index=False).sum()
+        check_has_nulls(df, name="DeferredLinearExpression")
+        return df
 
     def to_polars(self, **kwargs: Any) -> pl.DataFrame:
         """
-        Return polars DataFrame.
+        Return polars DataFrame by concatenating each part's polars output.
 
-        When parts have disjoint dimensions, concatenates each part's polars
-        output directly (no cross-product). Otherwise materializes first
-        to ensure correct broadcasting.
+        Always works without materialization — same reasoning as .flat.
         """
-        if self._has_disjoint_dims():
-            dfs = [p.to_polars(**kwargs) for p in self._parts]
-            df = pl.concat(dfs)
-            df = group_terms_polars(df)
-            check_has_nulls_polars(df, name="DeferredLinearExpression")
-            return df
-        return self.materialize().to_polars(**kwargs)
+        dfs = [p.to_polars(**kwargs) for p in self._parts]
+        df = pl.concat(dfs)
+        df = group_terms_polars(df)
+        check_has_nulls_polars(df, name="DeferredLinearExpression")
+        return df
 
     # ------------------------------------------------------------------
     # Constraint / objective helpers — materialize then delegate

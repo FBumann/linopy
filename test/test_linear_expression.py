@@ -1510,8 +1510,8 @@ def test_deferred_flat_disjoint_uses_fast_path() -> None:
         assert matched.iloc[0]["coeffs"] == row["coeffs"]
 
 
-def test_deferred_flat_overlapping_materializes_correctly() -> None:
-    """Overlapping-dims .flat materializes for correct broadcasting."""
+def test_deferred_flat_overlapping_concats_per_part() -> None:
+    """Overlapping-dims .flat concats per-part without materialization."""
     m = Model()
     x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
     z = m.add_variables(
@@ -1522,14 +1522,15 @@ def test_deferred_flat_overlapping_materializes_correctly() -> None:
     assert isinstance(deferred, DeferredLinearExpression)
     assert not deferred._has_disjoint_dims()
 
-    # Must materialize — x broadcasts across j, so each x-var gets coeff 3*3=9
-    materialized_flat = deferred.materialize().flat
-    deferred_flat = deferred.flat
-    # Both should be identical
-    merged = materialized_flat.merge(
-        deferred_flat, on="vars", suffixes=("_mat", "_def")
-    )
-    assert (merged["coeffs_mat"] == merged["coeffs_def"]).all()
+    # Per-part .flat: x-vars get coeff 3 (no broadcasting across j),
+    # z-vars get coeff 2. Each part is independent.
+    df = deferred.flat
+    x_labels = set(x.data.labels.values.flat)
+    z_labels = set(z.data.labels.values.flat)
+    x_rows = df[df.vars.isin(x_labels)]
+    z_rows = df[df.vars.isin(z_labels)]
+    assert (x_rows.coeffs == 3).all()
+    assert (z_rows.coeffs == 2).all()
 
 
 def test_deferred_sel_per_part() -> None:
