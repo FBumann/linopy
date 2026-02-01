@@ -196,29 +196,33 @@ def run_benchmarks(model_types=None, label=""):
 # ---------------------------------------------------------------------------
 
 
-def plot_comparison(file_a, file_b):
-    """4-panel comparison plot."""
+def plot_comparison(files):
+    """4-panel comparison plot for 2+ result files."""
     import matplotlib.pyplot as plt
 
-    with open(file_a) as f:
-        a = json.load(f)
-    with open(file_b) as f:
-        b = json.load(f)
+    datasets = []
+    markers = ["o", "s", "^", "D", "v", "P"]
+    for fpath in files:
+        with open(fpath) as f:
+            d = json.load(f)
+        d.setdefault("label", fpath)
+        datasets.append(d)
 
-    label_a = a.get("label", file_a)
-    label_b = b.get("label", file_b)
+    baseline = datasets[0]
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     # Panel 1: Peak memory vs nvars (all models, log-log)
     ax = axes[0, 0]
-    for data, label, marker in [(a, label_a, "o"), (b, label_b, "s")]:
+    for i, data in enumerate(datasets):
         nvars, mem = [], []
-        for mtype, runs in data["models"].items():
+        for runs in data["models"].values():
             for r in runs:
                 nvars.append(r["nvars"])
                 mem.append(r["peak_memory_mb"])
-        ax.scatter(nvars, mem, label=label, marker=marker, alpha=0.7)
+        ax.scatter(
+            nvars, mem, label=data["label"], marker=markers[i % len(markers)], alpha=0.7
+        )
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("nvars")
@@ -227,39 +231,52 @@ def plot_comparison(file_a, file_b):
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # Panel 2: Memory ratio (a/b) vs nvars
+    # Panel 2: Memory ratio vs baseline
     ax = axes[0, 1]
-    # Match runs by model type + params
-    for mtype in set(a["models"]) & set(b["models"]):
-        runs_a = {
-            json.dumps(r["params"], sort_keys=True): r for r in a["models"][mtype]
-        }
-        runs_b = {
-            json.dumps(r["params"], sort_keys=True): r for r in b["models"][mtype]
-        }
-        for key in set(runs_a) & set(runs_b):
-            ra, rb = runs_a[key], runs_b[key]
-            ratio = ra["peak_memory_mb"] / max(rb["peak_memory_mb"], 1e-6)
-            ax.scatter(ra["nvars"], ratio, marker="o", alpha=0.7, label=mtype)
+    for i, data in enumerate(datasets[1:], 1):
+        for mtype in set(baseline["models"]) & set(data["models"]):
+            runs_base = {
+                json.dumps(r["params"], sort_keys=True): r
+                for r in baseline["models"][mtype]
+            }
+            runs_cur = {
+                json.dumps(r["params"], sort_keys=True): r
+                for r in data["models"][mtype]
+            }
+            for key in set(runs_base) & set(runs_cur):
+                rb, rc = runs_base[key], runs_cur[key]
+                ratio = rc["peak_memory_mb"] / max(rb["peak_memory_mb"], 1e-6)
+                ax.scatter(
+                    rb["nvars"],
+                    ratio,
+                    marker=markers[i % len(markers)],
+                    alpha=0.7,
+                    label=f"{data['label']} ({mtype})",
+                )
     ax.axhline(1.0, color="k", linestyle="--", alpha=0.5)
     ax.set_xscale("log")
     ax.set_xlabel("nvars")
-    ax.set_ylabel(f"Memory Ratio ({label_a} / {label_b})")
-    ax.set_title("Memory Ratio")
+    ax.set_ylabel(f"Memory Ratio (vs {baseline['label']})")
+    ax.set_title("Memory Ratio vs Baseline")
     ax.grid(True, alpha=0.3)
-    # Deduplicate legend
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys())
+    handles, labels_ = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels_, handles))
+    ax.legend(by_label.values(), by_label.keys(), fontsize=7)
 
     # Panel 3: Story 1 detail
     ax = axes[1, 0]
-    for data, label, marker in [(a, label_a, "o"), (b, label_b, "s")]:
+    for i, data in enumerate(datasets):
         if "story1" in data["models"]:
             runs = data["models"]["story1"]
             nvars = [r["nvars"] for r in runs]
             mem = [r["peak_memory_mb"] for r in runs]
-            ax.plot(nvars, mem, marker=marker, label=label, alpha=0.7)
+            ax.plot(
+                nvars,
+                mem,
+                marker=markers[i % len(markers)],
+                label=data["label"],
+                alpha=0.7,
+            )
     ax.set_xlabel("nvars")
     ax.set_ylabel("Peak Memory (MB)")
     ax.set_title("Story 1: Sparse Mask + .sum()")
@@ -268,12 +285,18 @@ def plot_comparison(file_a, file_b):
 
     # Panel 4: Story 2 detail
     ax = axes[1, 1]
-    for data, label, marker in [(a, label_a, "o"), (b, label_b, "s")]:
+    for i, data in enumerate(datasets):
         if "story2" in data["models"]:
             runs = data["models"]["story2"]
             nvars = [r["nvars"] for r in runs]
             mem = [r["peak_memory_mb"] for r in runs]
-            ax.plot(nvars, mem, marker=marker, label=label, alpha=0.7)
+            ax.plot(
+                nvars,
+                mem,
+                marker=markers[i % len(markers)],
+                label=data["label"],
+                alpha=0.7,
+            )
     ax.set_xlabel("nvars")
     ax.set_ylabel("Peak Memory (MB)")
     ax.set_title("Story 2: Disjoint-Dim Cartesian Product")
@@ -302,12 +325,15 @@ def main():
         help="Which models to benchmark (default: all)",
     )
     parser.add_argument(
-        "--plot", nargs=2, metavar="JSON", help="Compare two result JSON files"
+        "--plot",
+        nargs="+",
+        metavar="JSON",
+        help="Compare result JSON files (first = baseline)",
     )
     args = parser.parse_args()
 
     if args.plot:
-        plot_comparison(args.plot[0], args.plot[1])
+        plot_comparison(args.plot)
         return
 
     print("Running model build benchmarks...")
