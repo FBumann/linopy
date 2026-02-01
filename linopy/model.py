@@ -591,6 +591,45 @@ class Model:
 
         variable.attrs.update(sos_type=sos_type, sos_dim=sos_dim)
 
+    def _label_constraint_dataset(
+        self, ds: Dataset, name: str, start: int, mask: MaskLike | None = None
+    ) -> tuple[Dataset, int]:
+        """
+        Assign sequential labels to a constraint dataset.
+
+        Performs infinity check, drops helper dims, broadcasts, assigns label
+        range, applies mask, and chunks. Returns ``(ds, next_start)``.
+        """
+        invalid_infinity_values = ((ds.sign == LESS_EQUAL) & (ds.rhs == -np.inf)) | (
+            (ds.sign == GREATER_EQUAL) & (ds.rhs == np.inf)
+        )
+        if invalid_infinity_values.any():
+            raise ValueError(f"Constraint {name} contains incorrect infinite values.")
+
+        if drop_dims := set(HELPER_DIMS).intersection(ds.coords):
+            ds = ds.drop_vars(drop_dims)
+
+        ds["labels"] = -1
+        (ds,) = xr.broadcast(ds, exclude=[TERM_DIM])
+
+        self.check_force_dim_names(ds)
+
+        n = ds.labels.size
+        ds.labels.values = np.arange(start, start + n).reshape(ds.labels.shape)
+
+        if mask is not None:
+            m = as_dataarray(mask).astype(bool)
+            assert set(m.dims).issubset(ds.dims), (
+                "Dimensions of mask not a subset of resulting labels dimensions."
+            )
+            ds.labels.values = ds.labels.where(m, -1).values
+
+        if self.chunk:
+            ds = ds.chunk(self.chunk)
+
+        ds = ds.assign_attrs(label_range=(start, start + n), name=name)
+        return ds, start + n
+
     def add_constraints(
         self,
         lhs: VariableLike
@@ -695,42 +734,8 @@ class Model:
             start = range_start
             labeled_parts: list[Dataset] = []
             for part in con._lazy_parts:
-                # Infinity check per-part
-                invalid_infinity_values = (
-                    (part.sign == LESS_EQUAL) & (part.rhs == -np.inf)
-                ) | ((part.sign == GREATER_EQUAL) & (part.rhs == np.inf))
-                if invalid_infinity_values.any():
-                    raise ValueError(
-                        f"Constraint {name} contains incorrect infinite values."
-                    )
-
-                # ensure helper dimensions are not set as coordinates
-                if drop_dims := set(HELPER_DIMS).intersection(part.coords):
-                    part = part.drop_vars(drop_dims)
-
-                part["labels"] = -1
-                (part,) = xr.broadcast(part, exclude=[TERM_DIM])
-
-                self.check_force_dim_names(part)
-
-                n = part.labels.size
-                part.labels.values = np.arange(start, start + n).reshape(
-                    part.labels.shape
-                )
-
-                if mask is not None:
-                    m = as_dataarray(mask).astype(bool)
-                    assert set(m.dims).issubset(part.dims), (
-                        "Dimensions of mask not a subset of resulting labels dimensions."
-                    )
-                    part.labels.values = part.labels.where(m, -1).values
-
-                if self.chunk:
-                    part = part.chunk(self.chunk)
-
-                part = part.assign_attrs(label_range=(start, start + n), name=name)
+                part, start = self._label_constraint_dataset(part, name, start, mask)
                 labeled_parts.append(part)
-                start += n
 
             self._cCounter = start
             constraint = Constraint(
@@ -746,42 +751,8 @@ class Model:
 
         # Standard (non-lazy) path
         data = con.data
-
-        invalid_infinity_values = (
-            (data.sign == LESS_EQUAL) & (data.rhs == -np.inf)
-        ) | ((data.sign == GREATER_EQUAL) & (data.rhs == np.inf))  # noqa: F821
-        if invalid_infinity_values.any():
-            raise ValueError(f"Constraint {name} contains incorrect infinite values.")
-
-        # ensure helper dimensions are not set as coordinates
-        if drop_dims := set(HELPER_DIMS).intersection(data.coords):
-            # TODO: add a warning here, routines should be safe against this
-            data = data.drop_vars(drop_dims)
-
-        data["labels"] = -1
-        (data,) = xr.broadcast(data, exclude=[TERM_DIM])
-
-        if mask is not None:
-            mask = as_dataarray(mask).astype(bool)
-            # TODO: simplify
-            assert set(mask.dims).issubset(data.dims), (
-                "Dimensions of mask not a subset of resulting labels dimensions."
-            )
-
-        self.check_force_dim_names(data)
-
-        start = self._cCounter
-        end = start + data.labels.size
-        data.labels.values = np.arange(start, end).reshape(data.labels.shape)
-        self._cCounter += data.labels.size
-
-        if mask is not None:
-            data.labels.values = data.labels.where(mask, -1).values
-
-        data = data.assign_attrs(label_range=(start, end), name=name)
-
-        if self.chunk:
-            data = data.chunk(self.chunk)
+        data, end = self._label_constraint_dataset(data, name, self._cCounter, mask)
+        self._cCounter = end
 
         constraint = Constraint(data, name=name, model=self, skip_broadcast=True)
         self.constraints.add(constraint)

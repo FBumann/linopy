@@ -1772,6 +1772,18 @@ class LinearExpression(BaseExpression):
         return LinearExpression(const_da, model)
 
 
+def _parts_are_disjoint(parts: list[Dataset]) -> bool:
+    """Check if all parts have non-empty, mutually disjoint coord dims."""
+    coord_dims = [set(k for k in p.sizes if k not in HELPER_DIMS) for p in parts]
+    if not all(coord_dims):
+        return False
+    for i, di in enumerate(coord_dims):
+        for dj in coord_dims[i + 1 :]:
+            if di & dj:
+                return False
+    return True
+
+
 class LazyLinearExpression(LinearExpression):
     """
     A LinearExpression that defers merge along _term.
@@ -2066,21 +2078,7 @@ class LazyLinearExpression(LinearExpression):
         # mutually disjoint coord dims. When parts share coords or have
         # empty dims (scalars), they must be merged so each constraint
         # label spans all terms at the same coordinate.
-        coord_dims_per_part = [
-            set(k for k, v in p.sizes.items() if k not in HELPER_DIMS)
-            for p in lhs._parts
-        ]
-        can_use_lazy = all(len(d) > 0 for d in coord_dims_per_part)
-        if can_use_lazy:
-            for i in range(len(coord_dims_per_part)):
-                for j in range(i + 1, len(coord_dims_per_part)):
-                    if coord_dims_per_part[i] & coord_dims_per_part[j]:
-                        can_use_lazy = False
-                        break
-                if not can_use_lazy:
-                    break
-
-        if not can_use_lazy:
+        if not _parts_are_disjoint(lhs._parts):
             # Materialize and use standard path
             return LinearExpression.to_constraint(lhs, sign, 0)
 

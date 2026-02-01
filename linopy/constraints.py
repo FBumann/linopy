@@ -692,6 +692,34 @@ class Constraint:
         check_has_nulls(df, name=f"{self.type} {name}")
         return df
 
+    @staticmethod
+    def _dataset_to_polars(ds: Dataset, name: str = "") -> pl.DataFrame:
+        """Convert a single constraint Dataset to a polars DataFrame."""
+        keys = [k for k in ds if ("_term" in ds[k].dims) or (k == "labels")]
+        long = to_polars(ds[keys])
+        long = filter_nulls_polars(long)
+        long = group_terms_polars(long)
+        check_has_nulls_polars(long, name=name)
+
+        short_ds = ds[[k for k in ds if "_term" not in ds[k].dims]]
+        schema = infer_schema_polars(short_ds)
+        schema["sign"] = pl.Enum(["=", "<=", ">="])
+        short = to_polars(short_ds, schema=schema)
+        short = filter_nulls_polars(short)
+        check_has_nulls_polars(short, name=name)
+
+        return pl.concat([short, long], how="diagonal_relaxed")
+
+    @staticmethod
+    def _finalize_polars(df: pl.DataFrame) -> pl.DataFrame:
+        """Sort, deduplicate rhs rows, and select columns."""
+        df = df.sort(["labels", "rhs"])
+        # delete subsequent non-null rhs (happens if all vars per label are -1)
+        is_non_null = df["rhs"].is_not_null()
+        prev_non_is_null = is_non_null.shift(1).fill_null(False)
+        df = df.filter(is_non_null & ~prev_non_is_null | ~is_non_null)
+        return df[["labels", "coeffs", "vars", "sign", "rhs"]]
+
     def to_polars(self) -> pl.DataFrame:
         """
         Convert the constraint to a polars DataFrame.
@@ -707,48 +735,15 @@ class Constraint:
         if self._lazy_parts:
             return self._to_polars_from_parts()
 
-        ds = self.data
-
-        keys = [k for k in ds if ("_term" in ds[k].dims) or (k == "labels")]
-        long = to_polars(ds[keys])
-
-        long = filter_nulls_polars(long)
-        long = group_terms_polars(long)
-        check_has_nulls_polars(long, name=f"{self.type} {self.name}")
-
-        short_ds = ds[[k for k in ds if "_term" not in ds[k].dims]]
-        schema = infer_schema_polars(short_ds)
-        schema["sign"] = pl.Enum(["=", "<=", ">="])
-        short = to_polars(short_ds, schema=schema)
-        short = filter_nulls_polars(short)
-        check_has_nulls_polars(short, name=f"{self.type} {self.name}")
-
-        df = pl.concat([short, long], how="diagonal_relaxed").sort(["labels", "rhs"])
-        # delete subsequent non-null rhs (happens is all vars per label are -1)
-        is_non_null = df["rhs"].is_not_null()
-        prev_non_is_null = is_non_null.shift(1).fill_null(False)
-        df = df.filter(is_non_null & ~prev_non_is_null | ~is_non_null)
-        return df[["labels", "coeffs", "vars", "sign", "rhs"]]
+        df = self._dataset_to_polars(self.data, name=f"{self.type} {self.name}")
+        return self._finalize_polars(df)
 
     def _to_polars_from_parts(self) -> pl.DataFrame:
         """Convert lazy constraint parts to polars DataFrame per-part."""
         assert self._lazy_parts is not None
-        frames = []
-        for part in self._lazy_parts:
-            keys = [k for k in part if ("_term" in part[k].dims) or (k == "labels")]
-            long = to_polars(part[keys])
-            long = filter_nulls_polars(long)
-            long = group_terms_polars(long)
-
-            short_ds = part[[k for k in part if "_term" not in part[k].dims]]
-            schema = infer_schema_polars(short_ds)
-            schema["sign"] = pl.Enum(["=", "<=", ">="])
-            short = to_polars(short_ds, schema=schema)
-            short = filter_nulls_polars(short)
-
-            df = pl.concat([short, long], how="diagonal_relaxed")
-            if len(df):
-                frames.append(df)
+        frames = [
+            df for part in self._lazy_parts if len(df := self._dataset_to_polars(part))
+        ]
 
         if not frames:
             return pl.DataFrame(
@@ -761,13 +756,10 @@ class Constraint:
                 }
             )
 
-        df = pl.concat(frames).sort(["labels", "rhs"])
-        is_non_null = df["rhs"].is_not_null()
-        prev_non_is_null = is_non_null.shift(1).fill_null(False)
-        df = df.filter(is_non_null & ~prev_non_is_null | ~is_non_null)
         name = self.name if self._data is not None else ""
+        df = self._finalize_polars(pl.concat(frames))
         check_has_nulls_polars(df, name=f"{self.type} {name}")
-        return df[["labels", "coeffs", "vars", "sign", "rhs"]]
+        return df
 
     # Wrapped function which would convert variable to dataarray
     assign = conwrap(Dataset.assign)
@@ -1053,62 +1045,57 @@ class Constraints:
         """
         return self[[n for n, s in self.items() if (s.sign == EQUAL).all()]]
 
+    def _apply_per_constraint(self, fn: Callable[[Dataset], Dataset]) -> None:
+        """Apply *fn* to each constraint's parts (lazy) or data (materialized)."""
+        for name in self:
+            con = self[name]
+            if con._lazy_parts:
+                con._lazy_parts[:] = [fn(part) for part in con._lazy_parts]
+            else:
+                con._data = fn(con.data)
+
     def sanitize_zeros(self) -> None:
         """
         Filter out terms with zero and close-to-zero coefficient.
         """
-        for name in self:
-            con = self[name]
-            if con._lazy_parts:
-                for i, part in enumerate(con._lazy_parts):
-                    not_zero = abs(part.coeffs) > 1e-10
-                    con._lazy_parts[i] = assign_multiindex_safe(
-                        part,
-                        vars=part.vars.where(not_zero, -1),
-                        coeffs=part.coeffs.where(not_zero),
-                    )
-            else:
-                not_zero = abs(con.coeffs) > 1e-10
-                con.vars = con.vars.where(not_zero, -1)
-                con.coeffs = con.coeffs.where(not_zero)
+
+        def _fn(ds: Dataset) -> Dataset:
+            not_zero = abs(ds.coeffs) > 1e-10
+            return assign_multiindex_safe(
+                ds,
+                vars=ds.vars.where(not_zero, -1),
+                coeffs=ds.coeffs.where(not_zero),
+            )
+
+        self._apply_per_constraint(_fn)
 
     def sanitize_missings(self) -> None:
         """
         Set constraints labels to -1 where all variables in the lhs are
         missing.
         """
-        for name in self:
-            con = self[name]
-            if con._lazy_parts:
-                for i, part in enumerate(con._lazy_parts):
-                    term_dim = [d for d in part.vars.dims if d.startswith("_term")][0]
-                    contains_non_missing = (part.vars != -1).any(term_dim)
-                    labels = part.labels.where(contains_non_missing, -1)
-                    con._lazy_parts[i] = assign_multiindex_safe(part, labels=labels)
-            else:
-                contains_non_missing = (con.vars != -1).any(con.term_dim)
-                labels = con.labels.where(contains_non_missing, -1)
-                con._data = assign_multiindex_safe(con.data, labels=labels)
+
+        def _fn(ds: Dataset) -> Dataset:
+            term_dim = [d for d in ds.vars.dims if d.startswith("_term")][0]
+            contains_non_missing = (ds.vars != -1).any(term_dim)
+            labels = ds.labels.where(contains_non_missing, -1)
+            return assign_multiindex_safe(ds, labels=labels)
+
+        self._apply_per_constraint(_fn)
 
     def sanitize_infinities(self) -> None:
         """
         Replace infinite values in the constraints with a large value.
         """
-        for name in self:
-            con = self[name]
-            if con._lazy_parts:
-                for i, part in enumerate(con._lazy_parts):
-                    valid = ((part.sign == LESS_EQUAL) & (part.rhs == np.inf)) | (
-                        (part.sign == GREATER_EQUAL) & (part.rhs == -np.inf)
-                    )
-                    labels = part.labels.where(~valid, -1)
-                    con._lazy_parts[i] = assign_multiindex_safe(part, labels=labels)
-            else:
-                valid_infinity_values = (
-                    (con.sign == LESS_EQUAL) & (con.rhs == np.inf)
-                ) | ((con.sign == GREATER_EQUAL) & (con.rhs == -np.inf))
-                labels = con.labels.where(~valid_infinity_values, -1)
-                con._data = assign_multiindex_safe(con.data, labels=labels)
+
+        def _fn(ds: Dataset) -> Dataset:
+            valid = ((ds.sign == LESS_EQUAL) & (ds.rhs == np.inf)) | (
+                (ds.sign == GREATER_EQUAL) & (ds.rhs == -np.inf)
+            )
+            labels = ds.labels.where(~valid, -1)
+            return assign_multiindex_safe(ds, labels=labels)
+
+        self._apply_per_constraint(_fn)
 
     def get_name_by_label(self, label: int | float) -> str:
         """
