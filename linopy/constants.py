@@ -33,6 +33,9 @@ sign_replace_dict: dict[str, str] = {
     short_LESS_EQUAL: LESS_EQUAL,
 }
 
+VARS_DTYPE = np.int32
+COEFFS_DTYPE = np.float32
+
 TERM_DIM = "_term"
 STACKED_TERM_DIM = "_stacked_term"
 GROUPED_TERM_DIM = "_grouped_term"

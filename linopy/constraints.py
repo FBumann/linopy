@@ -56,11 +56,13 @@ from linopy.common import (
 )
 from linopy.config import options
 from linopy.constants import (
+    COEFFS_DTYPE,
     EQUAL,
     GREATER_EQUAL,
     HELPER_DIMS,
     LESS_EQUAL,
     TERM_DIM,
+    VARS_DTYPE,
     SIGNS_pretty,
 )
 from linopy.types import (
@@ -150,6 +152,15 @@ class Constraint:
 
         if not skip_broadcast:
             (data,) = xr.broadcast(data, exclude=[TERM_DIM])
+
+        if np.issubdtype(data.vars.dtype, np.floating):
+            data = assign_multiindex_safe(
+                data, vars=data.vars.fillna(-1).astype(VARS_DTYPE)
+            )
+        elif data.vars.dtype != VARS_DTYPE:
+            data = assign_multiindex_safe(data, vars=data.vars.astype(VARS_DTYPE))
+        if data.coeffs.dtype != COEFFS_DTYPE:
+            data = assign_multiindex_safe(data, coeffs=data.coeffs.astype(COEFFS_DTYPE))
 
         self._assigned = "labels" in data
         self._data = data

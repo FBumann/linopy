@@ -67,6 +67,7 @@ from linopy.common import (
 )
 from linopy.config import options
 from linopy.constants import (
+    COEFFS_DTYPE,
     CV_DIM,
     EQUAL,
     FACTOR_DIM,
@@ -77,6 +78,7 @@ from linopy.constants import (
     LESS_EQUAL,
     STACKED_TERM_DIM,
     TERM_DIM,
+    VARS_DTYPE,
 )
 from linopy.types import (
     ConstantLike,
@@ -104,7 +106,7 @@ SUPPORTED_CONSTANT_TYPES = (
 )
 
 
-FILL_VALUE = {"vars": -1, "coeffs": np.nan, "const": np.nan}
+FILL_VALUE = {"vars": VARS_DTYPE(-1), "coeffs": COEFFS_DTYPE("nan"), "const": np.nan}
 
 
 def exprwrap(
@@ -360,9 +362,15 @@ class BaseExpression(ABC):
             )
 
         if np.issubdtype(data.vars, np.floating):
-            data = assign_multiindex_safe(data, vars=data.vars.fillna(-1).astype(int))
+            data = assign_multiindex_safe(
+                data, vars=data.vars.fillna(-1).astype(VARS_DTYPE)
+            )
+        elif data.vars.dtype != VARS_DTYPE:
+            data = assign_multiindex_safe(data, vars=data.vars.astype(VARS_DTYPE))
         if not np.issubdtype(data.coeffs, np.floating):
-            data["coeffs"].values = data.coeffs.values.astype(float)
+            data = assign_multiindex_safe(data, coeffs=data.coeffs.astype(COEFFS_DTYPE))
+        elif data.coeffs.dtype != COEFFS_DTYPE:
+            data = assign_multiindex_safe(data, coeffs=data.coeffs.astype(COEFFS_DTYPE))
 
         data = fill_missing_coords(data)
 
@@ -2137,7 +2145,49 @@ def merge(
         else:
             kwargs.setdefault("join", "outer")
 
-    if dim == TERM_DIM:
+    # Check if all expressions have exactly the same coord dims and sizes
+    _can_fast_merge = (
+        dim == TERM_DIM
+        and override
+        and cls == LinearExpression
+        and len(data) > 1
+        and all(
+            {k: v for k, v in d.sizes.items() if k not in HELPER_DIMS}
+            == {k: v for k, v in data[0].sizes.items() if k not in HELPER_DIMS}
+            for d in data[1:]
+        )
+    )
+    if _can_fast_merge:
+        # Fast path: all expressions have same coord dims, pre-allocate
+        total_terms = sum(d.sizes.get(TERM_DIM, 0) for d in data)
+        # Use first expression's coords as template
+        template = data[0]
+        coord_dims = [d for d in template.dims if d not in HELPER_DIMS]
+        coord_shape = tuple(template.sizes[d] for d in coord_dims)
+
+        out_coeffs = np.full((*coord_shape, total_terms), np.nan, dtype=COEFFS_DTYPE)
+        out_vars = np.full((*coord_shape, total_terms), -1, dtype=VARS_DTYPE)
+
+        offset = 0
+        const_sum = data[0]["const"].copy(deep=True) * 0  # zeros with right shape
+        for d in data:
+            n = d.sizes.get(TERM_DIM, 0)
+            if n > 0:
+                out_coeffs[..., offset : offset + n] = d["coeffs"].values
+                out_vars[..., offset : offset + n] = d["vars"].values
+            offset += n
+            const_sum = const_sum + d["const"]
+
+        all_dims = list(coord_dims) + [TERM_DIM]
+        coords = {d: template.coords[d] for d in coord_dims if d in template.coords}
+        ds = xr.Dataset(
+            {
+                "coeffs": xr.DataArray(out_coeffs, dims=all_dims, coords=coords),
+                "vars": xr.DataArray(out_vars, dims=all_dims, coords=coords),
+                "const": const_sum,
+            }
+        )
+    elif dim == TERM_DIM:
         ds = xr.concat([d[["coeffs", "vars"]] for d in data], dim, **kwargs)
         subkwargs = {**kwargs, "fill_value": 0}
         const = xr.concat([d["const"] for d in data], dim, **subkwargs).sum(TERM_DIM)
