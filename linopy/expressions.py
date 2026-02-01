@@ -793,7 +793,7 @@ class BaseExpression(ABC):
 
         res = self.__class__(self._sum(self, dim=dim), self.model)
 
-        if drop_zeros:
+        if drop_zeros and isinstance(res, LinearExpression):
             res = res.densify_terms()
 
         return res
@@ -1107,10 +1107,29 @@ class BaseExpression(ABC):
         cdata = data.coeffs.data
         axis = cdata.ndim - 1
         nnz = np.nonzero(cdata)
-        nterm = (cdata != 0).sum(axis).max()
+        nterm_per_cell = (cdata != 0).sum(axis)
+        if nterm_per_cell.size == 0 or nterm_per_cell.max() == 0:
+            return self.__class__(data.sel({TERM_DIM: slice(0, 1)}), self.model)
+        nterm = nterm_per_cell.max()
+
+        # Nothing to compact if all term slots are already used
+        if nterm == cdata.shape[axis]:
+            return self
 
         mod_nnz = list(nnz)
         mod_nnz.pop(axis)
+
+        if not mod_nnz:
+            # Scalar case (only _term dimension): all nonzeros map to positions 0,1,2,...
+            new_index = np.arange(len(nnz[0]))
+            mod_nnz.insert(axis, new_index)
+            vdata = np.full_like(cdata, -1)
+            vdata[tuple(mod_nnz)] = data.vars.data[nnz]
+            data.vars.data = vdata
+            cdata_new = np.zeros_like(cdata)
+            cdata_new[tuple(mod_nnz)] = data.coeffs.data[nnz]
+            data.coeffs.data = cdata_new
+            return self.__class__(data.sel({TERM_DIM: slice(0, nterm)}), self.model)
 
         remaining_axes = np.vstack(mod_nnz).T
         _, idx_ = np.unique(remaining_axes, axis=0, return_inverse=True)
