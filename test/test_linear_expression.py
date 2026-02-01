@@ -1530,3 +1530,49 @@ def test_deferred_flat_overlapping_materializes_correctly() -> None:
         deferred_flat, on="vars", suffixes=("_mat", "_def")
     )
     assert (merged["coeffs_mat"] == merged["coeffs_def"]).all()
+
+
+def test_deferred_sel_per_part() -> None:
+    """sel() on disjoint deferred applies only to the relevant part."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    assert isinstance(deferred, DeferredLinearExpression)
+
+    # sel on dim "i" should only affect the x-part
+    result = deferred.sel(i=0)
+    assert isinstance(result, DeferredLinearExpression)
+    assert len(result._parts) == 2
+    # x-part is now scalar (i selected), y-part is unchanged
+    assert result._parts[0].coord_dims == ()
+    assert result._parts[1].coord_dims == ("j",)
+
+
+def test_deferred_rename_per_part() -> None:
+    """rename() on disjoint deferred applies only to the relevant part."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    renamed = deferred.rename({"i": "k"})
+    assert isinstance(renamed, DeferredLinearExpression)
+    assert renamed._parts[0].coord_dims == ("k",)
+    assert renamed._parts[1].coord_dims == ("j",)
+
+
+def test_deferred_shift_per_part() -> None:
+    """shift() on disjoint deferred applies only to the relevant part."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    shifted = deferred.shift(i=1)
+    assert isinstance(shifted, DeferredLinearExpression)
+    # y-part should be unchanged
+    from linopy.testing import assert_linequal
+
+    assert_linequal(shifted._parts[1], (4 * y))

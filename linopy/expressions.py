@@ -2543,6 +2543,84 @@ class DeferredLinearExpression:
         return self.materialize().__eq__(other)
 
     # ------------------------------------------------------------------
+    # Per-part dimension operations (no materialization for disjoint dims)
+    # ------------------------------------------------------------------
+
+    def _apply_to_parts(
+        self,
+        method_name: str,
+        target_dims: set[Hashable],
+        args: tuple,
+        kwargs: dict,
+    ) -> DeferredLinearExpression:
+        """
+        Apply a dimension-specific operation to only the parts that contain
+        the target dimensions. Other parts pass through unchanged.
+
+        Falls back to materialization if dims are not disjoint.
+        """
+        if not self._has_disjoint_dims():
+            result = getattr(self.materialize(), method_name)(*args, **kwargs)
+            return result
+
+        new_parts = []
+        for p in self._parts:
+            p_dims = set(p.coord_dims)
+            if p_dims & target_dims:
+                new_parts.append(getattr(p, method_name)(*args, **kwargs))
+            else:
+                new_parts.append(p)
+        return DeferredLinearExpression(new_parts, self._model)
+
+    def sel(self, *args: Any, **kwargs: Any) -> DeferredLinearExpression:
+        # Extract dimension names from positional dict or kwargs
+        indexers = args[0] if args else {}
+        target_dims = set(indexers) | (set(kwargs) - {"method", "tolerance", "drop"})
+        return self._apply_to_parts("sel", target_dims, args, kwargs)
+
+    def isel(self, *args: Any, **kwargs: Any) -> DeferredLinearExpression:
+        indexers = args[0] if args else {}
+        target_dims = set(indexers) | (set(kwargs) - {"drop", "missing_dims"})
+        return self._apply_to_parts("isel", target_dims, args, kwargs)
+
+    def rename(
+        self, mapping: Mapping[Hashable, Hashable] | None = None, **kwargs: Any
+    ) -> DeferredLinearExpression:
+        name_map = mapping or kwargs
+        target_dims = set(name_map)
+        return self._apply_to_parts(
+            "rename",
+            target_dims,
+            (name_map,) if mapping else (),
+            kwargs if not mapping else {},
+        )
+
+    def shift(
+        self, shifts: Mapping[Hashable, int] | None = None, **kwargs: Any
+    ) -> DeferredLinearExpression:
+        shift_map = shifts or kwargs
+        target_dims = set(shift_map)
+        return self._apply_to_parts(
+            "shift",
+            target_dims,
+            (shift_map,) if shifts else (),
+            kwargs if not shifts else {},
+        )
+
+    def diff(self, dim: str, n: int = 1) -> DeferredLinearExpression:
+        return self._apply_to_parts("diff", {dim}, (dim, n), {})
+
+    def drop_sel(self, *args: Any, **kwargs: Any) -> DeferredLinearExpression:
+        indexers = args[0] if args else {}
+        target_dims = set(indexers) | (set(kwargs) - {"errors"})
+        return self._apply_to_parts("drop_sel", target_dims, args, kwargs)
+
+    def drop_isel(self, *args: Any, **kwargs: Any) -> DeferredLinearExpression:
+        indexers = args[0] if args else {}
+        target_dims = set(indexers) | (set(kwargs) - {"errors"})
+        return self._apply_to_parts("drop_isel", target_dims, args, kwargs)
+
+    # ------------------------------------------------------------------
     # Fallback — materialize and delegate
     # ------------------------------------------------------------------
 
