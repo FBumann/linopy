@@ -2442,12 +2442,27 @@ class DeferredLinearExpression:
 
     @property
     def flat(self) -> pd.DataFrame:
-        """Convert to flat DataFrame. Materializes if parts have overlapping semantics."""
-        return self.materialize().flat
+        """
+        Concatenate flat outputs from each part, then groupby-sum.
+
+        This avoids materializing the full dense cross-product array.
+        The result is equivalent to ``self.materialize().flat`` when each
+        part's variables are independent (disjoint variable labels across
+        the broadcast dimensions).
+        """
+        dfs = [p.flat for p in self._parts]
+        df = pd.concat(dfs, ignore_index=True)
+        df = df.groupby("vars", as_index=False).sum()
+        check_has_nulls(df, name="DeferredLinearExpression")
+        return df
 
     def to_polars(self) -> pl.DataFrame:
-        """Convert to polars DataFrame. Materializes if parts have overlapping semantics."""
-        return self.materialize().to_polars()
+        """Concatenate polars outputs from each part, then group."""
+        dfs = [p.to_polars() for p in self._parts]
+        df = pl.concat(dfs)
+        df = group_terms_polars(df)
+        check_has_nulls_polars(df, name="DeferredLinearExpression")
+        return df
 
     # ------------------------------------------------------------------
     # Constraint / objective helpers — materialize then delegate

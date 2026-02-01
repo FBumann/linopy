@@ -16,7 +16,7 @@ from xarray.testing import assert_equal
 
 from linopy import LinearExpression, Model, QuadraticExpression, Variable, merge
 from linopy.constants import HELPER_DIMS, TERM_DIM
-from linopy.expressions import ScalarLinearExpression
+from linopy.expressions import DeferredLinearExpression, ScalarLinearExpression
 from linopy.testing import assert_linequal, assert_quadequal
 from linopy.variables import ScalarVariable
 
@@ -1313,3 +1313,172 @@ def test_simplify_partial_cancellation(x: Variable, y: Variable) -> None:
     assert all(simplified.coeffs.values == 3.0), (
         f"Expected coefficient 3.0, got {simplified.coeffs.values}"
     )
+
+
+# =====================================================================
+# DeferredLinearExpression tests
+# =====================================================================
+
+
+def test_deferred_creation_different_shapes() -> None:
+    """Adding expressions with different coord dims produces DeferredLinearExpression."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    result = 3 * x + 4 * y
+    assert isinstance(result, DeferredLinearExpression)
+    assert len(result._parts) == 2
+
+
+def test_deferred_not_created_same_shapes() -> None:
+    """Adding expressions with same coord dims stays LinearExpression."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="y")
+
+    result = 3 * x + 4 * y
+    assert isinstance(result, LinearExpression)
+
+
+def test_deferred_materialize_equivalence() -> None:
+    """Materialized deferred gives same result as eager merge."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    eager = merge([3 * x, 4 * y], cls=LinearExpression)
+
+    assert_linequal(deferred, eager)
+
+
+def test_deferred_chain_flattens_parts() -> None:
+    """Chaining adds flattens nested DeferredLinearExpressions."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+    z = m.add_variables(coords=[pd.Index([0, 1], name="k")], name="z")
+
+    result = 3 * x + 4 * y + 2 * z
+    assert isinstance(result, DeferredLinearExpression)
+    assert len(result._parts) == 3
+
+
+def test_deferred_neg() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    result = -(3 * x + 4 * y)
+    assert isinstance(result, DeferredLinearExpression)
+    mat = result.materialize()
+    assert (mat.coeffs.sel(i=0, j=0).values == [-3, -4]).all()
+
+
+def test_deferred_mul() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    result = (3 * x + 4 * y) * 2
+    assert isinstance(result, DeferredLinearExpression)
+    mat = result.materialize()
+    assert (mat.coeffs.sel(i=0, j=0).values == [6, 8]).all()
+
+
+def test_deferred_sub() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    result = 3 * x - 4 * y
+    assert isinstance(result, DeferredLinearExpression)
+    mat = result.materialize()
+    assert (mat.coeffs.sel(i=0, j=0).values == [3, -4]).all()
+
+
+def test_deferred_to_constraint() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    con = deferred >= 0
+    assert con is not None
+
+
+def test_deferred_add_constraints() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    m.add_constraints(deferred, ">=", 0, name="con1")
+    assert "con1" in m.constraints
+
+
+def test_deferred_add_objective() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    m.add_objective(deferred)
+
+
+def test_deferred_sum_materializes() -> None:
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    result = deferred.sum()
+    assert isinstance(result, LinearExpression)
+
+
+def test_deferred_flat_has_all_variables() -> None:
+    """Deferred .flat includes all variables from all parts."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1, 2], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    flat = deferred.flat
+    # 3 x-vars + 2 y-vars = 5 total
+    assert len(flat) == 5
+    assert set(flat["vars"].values) == {0, 1, 2, 3, 4}
+
+
+def test_deferred_many_disjoint_parts() -> None:
+    """Sum 20 expressions with disjoint coords, verify deferred.flat is correct."""
+    m = Model()
+    exprs = []
+    for k in range(20):
+        v = m.add_variables(
+            coords=[pd.Index([k * 10 + j for j in range(5)], name=f"d{k}")],
+            name=f"v{k}",
+        )
+        exprs.append((k + 1) * v)
+
+    # Build deferred via chained addition
+    deferred = exprs[0]
+    for e in exprs[1:]:
+        deferred = deferred + e
+    assert isinstance(deferred, DeferredLinearExpression)
+    assert len(deferred._parts) == 20
+
+    # Verify flat output has the correct number of entries (20 groups × 5 vars)
+    flat = deferred.flat
+    assert len(flat) == 100  # 20 * 5 variables
+
+    # Each part k has coefficient (k+1), 5 variables
+    # Verify coefficients sum up correctly
+    for k in range(20):
+        # Variables for part k start at label offset in the model
+        part_flat = exprs[k].flat
+        for _, row in part_flat.iterrows():
+            var_id = int(row["vars"])
+            matched = flat[flat["vars"] == var_id]
+            assert len(matched) == 1
+            assert matched.iloc[0]["coeffs"] == row["coeffs"]
