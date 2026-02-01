@@ -179,7 +179,13 @@ class Objective:
             expr = self.model.linexpr(*expr)
 
         if isinstance(expr, expressions.DeferredLinearExpression):
-            expr = expr.materialize()
+            if expr._has_disjoint_dims():
+                # Sum each part independently, then merge the (scalar) results.
+                # This avoids materializing the dense cross-product array.
+                summed = [p.sum() if len(p.coord_dims) else p for p in expr._parts]
+                expr = expressions.merge(summed, cls=expressions.LinearExpression)
+            else:
+                expr = expr.materialize()
 
         if not isinstance(
             expr, expressions.LinearExpression | expressions.QuadraticExpression

@@ -2432,8 +2432,30 @@ class DeferredLinearExpression:
         except TypeError:
             return NotImplemented
 
+    def _has_disjoint_dims(self) -> bool:
+        """Check if all parts have completely disjoint coordinate dimensions."""
+        from linopy.constants import HELPER_DIMS
+
+        seen: set[str] = set()
+        for p in self._parts:
+            dims = {k for k in p.sizes if k not in HELPER_DIMS}
+            if dims & seen:
+                return False
+            seen |= dims
+        return True
+
     def sum(self, dim: DimsLike | None = None, **kwargs: Any) -> LinearExpression:
-        """Sum the expression. Materializes first to ensure correct broadcasting."""
+        """
+        Sum the expression over dimensions.
+
+        When summing over all dimensions (dim=None) and parts have completely
+        disjoint coordinate dimensions, each part is summed independently and
+        then merged — avoiding the dense cross-product. Otherwise,
+        materialization is needed to ensure correct broadcasting semantics.
+        """
+        if dim is None and self._has_disjoint_dims():
+            summed = [p.sum(**kwargs) for p in self._parts]
+            return merge(summed, cls=LinearExpression)
         return self.materialize().sum(dim=dim, **kwargs)
 
     # ------------------------------------------------------------------

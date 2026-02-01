@@ -760,8 +760,6 @@ class Model:
                 "Objective already defined."
                 " Set `overwrite` to True to force overwriting."
             )
-        if isinstance(expr, DeferredLinearExpression):
-            expr = expr.materialize()
         if isinstance(expr, Variable):
             expr = 1 * expr
         self.objective.expression = expr
