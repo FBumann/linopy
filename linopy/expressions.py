@@ -2051,6 +2051,59 @@ class LazyLinearExpression(LinearExpression):
             const=self._const_override,
         )
 
+    def to_constraint(self, sign: SignLike, rhs: SideLike) -> Constraint:
+        """Build constraint per-part to avoid Cartesian-product materialization."""
+        if not self.is_lazy:
+            return super().to_constraint(sign, rhs)
+
+        # Compute lhs = self - rhs (stays lazy for scalar/constant rhs)
+        lhs = self - rhs
+        if not (isinstance(lhs, LazyLinearExpression) and lhs.is_lazy):
+            # Fell back to non-lazy, use standard path
+            return LinearExpression.to_constraint(lhs, sign, 0)
+
+        # Only use lazy constraint path when ALL parts have non-empty,
+        # mutually disjoint coord dims. When parts share coords or have
+        # empty dims (scalars), they must be merged so each constraint
+        # label spans all terms at the same coordinate.
+        coord_dims_per_part = [
+            set(k for k, v in p.sizes.items() if k not in HELPER_DIMS)
+            for p in lhs._parts
+        ]
+        can_use_lazy = all(len(d) > 0 for d in coord_dims_per_part)
+        if can_use_lazy:
+            for i in range(len(coord_dims_per_part)):
+                for j in range(i + 1, len(coord_dims_per_part)):
+                    if coord_dims_per_part[i] & coord_dims_per_part[j]:
+                        can_use_lazy = False
+                        break
+                if not can_use_lazy:
+                    break
+
+        if not can_use_lazy:
+            # Materialize and use standard path
+            return LinearExpression.to_constraint(lhs, sign, 0)
+
+        # Build per-part constraint datasets
+        # Use raw _const_override (scalar) to avoid broadcasting across
+        # disjoint dimensions when assigning rhs to each part
+        raw_const = (
+            lhs._const_override
+            if lhs._const_override is not None
+            else xr.DataArray(0.0)
+        )
+        rhs_val = -raw_const
+        constraint_parts: list[Dataset] = []
+        for part in lhs._parts:
+            ds = assign_multiindex_safe(
+                part[["coeffs", "vars"]], sign=sign, rhs=rhs_val
+            )
+            constraint_parts.append(ds)
+
+        return constraints.Constraint(
+            None, model=self.model, lazy_parts=constraint_parts
+        )
+
     def to_polars(self) -> pl.DataFrame:
         """Convert the expression to a polars DataFrame without materializing."""
         if not self.is_lazy:

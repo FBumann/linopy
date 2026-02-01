@@ -656,37 +656,96 @@ class Model:
         if sign is not None:
             sign = maybe_replace_signs(as_dataarray(sign))
 
+        con: Constraint | None = None
         if isinstance(lhs, LinearExpression):
             if sign is None or rhs is None:
                 raise ValueError(msg_sign_rhs_not_none)
-            data = lhs.to_constraint(sign, rhs).data
+            con = lhs.to_constraint(sign, rhs)
         elif isinstance(lhs, list | tuple):
             if sign is None or rhs is None:
                 raise ValueError(msg_sign_rhs_none)
-            data = self.linexpr(*lhs).to_constraint(sign, rhs).data
+            con = self.linexpr(*lhs).to_constraint(sign, rhs)
         # directly convert first argument to a constraint
         elif callable(lhs):
             assert coords is not None, "`coords` must be given when lhs is a function"
             rule = lhs
             if sign is not None or rhs is not None:
                 raise ValueError(msg_sign_rhs_none)
-            data = Constraint.from_rule(self, rule, coords).data
+            con = Constraint.from_rule(self, rule, coords)
         elif isinstance(lhs, AnonymousScalarConstraint):
             if sign is not None or rhs is not None:
                 raise ValueError(msg_sign_rhs_none)
-            data = lhs.to_constraint().data
+            con = lhs.to_constraint()
         elif isinstance(lhs, Constraint):
             if sign is not None or rhs is not None:
                 raise ValueError(msg_sign_rhs_none)
-            data = lhs.data
+            con = lhs
         elif isinstance(lhs, Variable | ScalarVariable | ScalarLinearExpression):
             if sign is None or rhs is None:
                 raise ValueError(msg_sign_rhs_not_none)
-            data = lhs.to_linexpr().to_constraint(sign, rhs).data
+            con = lhs.to_linexpr().to_constraint(sign, rhs)
         else:
             raise ValueError(
                 f"Invalid type of `lhs` ({type(lhs)}) or invalid combination of `lhs`, `sign` and `rhs`."
             )
+
+        # Lazy constraint path: per-part label assignment
+        if con._lazy_parts is not None:
+            range_start = self._cCounter
+            start = range_start
+            labeled_parts: list[Dataset] = []
+            for part in con._lazy_parts:
+                # Infinity check per-part
+                invalid_infinity_values = (
+                    (part.sign == LESS_EQUAL) & (part.rhs == -np.inf)
+                ) | ((part.sign == GREATER_EQUAL) & (part.rhs == np.inf))
+                if invalid_infinity_values.any():
+                    raise ValueError(
+                        f"Constraint {name} contains incorrect infinite values."
+                    )
+
+                # ensure helper dimensions are not set as coordinates
+                if drop_dims := set(HELPER_DIMS).intersection(part.coords):
+                    part = part.drop_vars(drop_dims)
+
+                part["labels"] = -1
+                (part,) = xr.broadcast(part, exclude=[TERM_DIM])
+
+                self.check_force_dim_names(part)
+
+                n = part.labels.size
+                part.labels.values = np.arange(start, start + n).reshape(
+                    part.labels.shape
+                )
+
+                if mask is not None:
+                    m = as_dataarray(mask).astype(bool)
+                    assert set(m.dims).issubset(part.dims), (
+                        "Dimensions of mask not a subset of resulting labels dimensions."
+                    )
+                    part.labels.values = part.labels.where(m, -1).values
+
+                if self.chunk:
+                    part = part.chunk(self.chunk)
+
+                part = part.assign_attrs(label_range=(start, start + n), name=name)
+                labeled_parts.append(part)
+                start += n
+
+            self._cCounter = start
+            constraint = Constraint(
+                None,
+                name=name,
+                model=self,
+                lazy_parts=labeled_parts,
+            )
+            # Store overall label_range for get_name_by_label
+            constraint._label_range = (range_start, start)
+            self.constraints.add(constraint)
+            return constraint
+
+        # Standard (non-lazy) path
+        data = con.data
 
         invalid_infinity_values = (
             (data.sign == LESS_EQUAL) & (data.rhs == -np.inf)

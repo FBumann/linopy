@@ -109,37 +109,54 @@ class Constraint:
     functions can be applied to it.
     """
 
-    __slots__ = ("_data", "_model", "_assigned")
+    __slots__ = ("_data", "_model", "_assigned", "_lazy_parts", "_name", "_label_range")
 
     _fill_value = FILL_VALUE
 
     def __init__(
         self,
-        data: Dataset,
+        data: Dataset | None,
         model: Model,
         name: str = "",
         skip_broadcast: bool = False,
+        lazy_parts: list[Dataset] | None = None,
     ) -> None:
         """
         Initialize the Constraint.
 
         Parameters
         ----------
-        labels : xarray.DataArray
-            labels of the constraint.
+        data : xarray.Dataset or None
+            Constraint data. Can be None when lazy_parts is provided.
         model : linopy.Model
             Underlying model.
         name : str
             Name of the constraint.
+        skip_broadcast : bool
+            Skip broadcasting data.
+        lazy_parts : list of Dataset, optional
+            Per-part constraint datasets for lazy evaluation. When set,
+            data can be None and will be materialized on first access.
         """
 
         from linopy.model import Model
 
-        if not isinstance(data, Dataset):
-            raise ValueError(f"data must be a Dataset, got {type(data)}")
-
         if not isinstance(model, Model):
             raise ValueError(f"model must be a Model, got {type(model)}")
+
+        self._model = model
+        self._lazy_parts = lazy_parts
+        self._name = name
+        self._label_range = None
+
+        if lazy_parts is not None:
+            # Defer materialization — _data computed on first .data access
+            self._data = None
+            self._assigned = False
+            return
+
+        if not isinstance(data, Dataset):
+            raise ValueError(f"data must be a Dataset, got {type(data)}")
 
         # check that `labels`, `lower` and `upper`, `sign` and `mask` are in data
         for attr in ("coeffs", "vars", "sign", "rhs"):
@@ -153,7 +170,6 @@ class Constraint:
 
         self._assigned = "labels" in data
         self._data = data
-        self._model = model
 
     def __getitem__(
         self, selector: str | int | slice | list | tuple | dict
@@ -171,6 +187,11 @@ class Constraint:
         """
         Get the attributes of the constraint.
         """
+        if self._data is None and self._lazy_parts:
+            attrs = {"name": self._name}
+            if self._label_range is not None:
+                attrs["label_range"] = self._label_range
+            return attrs
         return self.data.attrs
 
     @property
@@ -238,7 +259,37 @@ class Constraint:
         """
         Get the underlying DataArray.
         """
+        if self._data is None and self._lazy_parts:
+            self._materialize_from_parts()
         return self._data
+
+    def _materialize_from_parts(self) -> None:
+        """Materialize constraint data from lazy parts (fallback)."""
+        from linopy.common import check_common_keys_values
+        from linopy.constants import HELPER_DIMS
+
+        coord_dims = [
+            {k: v for k, v in p.sizes.items() if k not in HELPER_DIMS}
+            for p in self._lazy_parts
+        ]
+        override = check_common_keys_values(coord_dims)
+        kwargs = {
+            "coords": "minimal",
+            "compat": "override",
+            "fill_value": FILL_VALUE,
+            "join": "override" if override else "outer",
+        }
+        ds = xr.concat(self._lazy_parts, TERM_DIM, **kwargs)
+        for d in set(HELPER_DIMS) & set(ds.coords):
+            ds = ds.reset_index(d, drop=True)
+        (ds,) = xr.broadcast(ds, exclude=[TERM_DIM])
+        attrs = {"name": self._name}
+        if self._label_range is not None:
+            attrs["label_range"] = self._label_range
+        ds = ds.assign_attrs(**attrs)
+        self._data = ds
+        self._assigned = "labels" in ds
+        self._lazy_parts = None  # clear parts after materialization
 
     @property
     def labels(self) -> DataArray:
@@ -586,6 +637,9 @@ class Constraint:
         -------
         df : pandas.DataFrame
         """
+        if self._lazy_parts:
+            return self._flat_from_parts()
+
         ds = self.data
 
         def mask_func(data: pd.DataFrame) -> pd.Series:
@@ -604,6 +658,36 @@ class Constraint:
         check_has_nulls(df, name=f"{self.type} {self.name}")
         return df
 
+    def _flat_from_parts(self) -> pd.DataFrame:
+        """Convert lazy constraint parts to flat DataFrame per-part."""
+
+        def mask_func(data: dict) -> pd.Series:
+            mask = (data["vars"] != -1) & (data["coeffs"] != 0)
+            if "labels" in data:
+                mask &= data["labels"] != -1
+            return mask
+
+        frames = []
+        for part in self._lazy_parts:
+            df = to_dataframe(part, mask_func=mask_func)
+            if len(df):
+                frames.append(df)
+
+        if not frames:
+            return pd.DataFrame(columns=["coeffs", "vars", "labels", "rhs", "sign"])
+
+        df = pd.concat(frames, ignore_index=True)
+
+        # Group repeated variables in the same constraint
+        group_keys = ["labels", "vars"] if "labels" in df.columns else ["vars"]
+        agg_custom = {k: "first" for k in list(df.columns)}
+        agg_standards = dict(coeffs="sum", rhs="first", sign="first")
+        agg = {**agg_custom, **agg_standards}
+        df = df.groupby(group_keys, as_index=False).aggregate(agg)
+        name = self.name if self._data is not None else ""
+        check_has_nulls(df, name=f"{self.type} {name}")
+        return df
+
     def to_polars(self) -> pl.DataFrame:
         """
         Convert the constraint to a polars DataFrame.
@@ -616,6 +700,9 @@ class Constraint:
         -------
         df : polars.DataFrame
         """
+        if self._lazy_parts:
+            return self._to_polars_from_parts()
+
         ds = self.data
 
         keys = [k for k in ds if ("_term" in ds[k].dims) or (k == "labels")]
@@ -637,6 +724,44 @@ class Constraint:
         is_non_null = df["rhs"].is_not_null()
         prev_non_is_null = is_non_null.shift(1).fill_null(False)
         df = df.filter(is_non_null & ~prev_non_is_null | ~is_non_null)
+        return df[["labels", "coeffs", "vars", "sign", "rhs"]]
+
+    def _to_polars_from_parts(self) -> pl.DataFrame:
+        """Convert lazy constraint parts to polars DataFrame per-part."""
+        frames = []
+        for part in self._lazy_parts:
+            keys = [k for k in part if ("_term" in part[k].dims) or (k == "labels")]
+            long = to_polars(part[keys])
+            long = filter_nulls_polars(long)
+            long = group_terms_polars(long)
+
+            short_ds = part[[k for k in part if "_term" not in part[k].dims]]
+            schema = infer_schema_polars(short_ds)
+            schema["sign"] = pl.Enum(["=", "<=", ">="])
+            short = to_polars(short_ds, schema=schema)
+            short = filter_nulls_polars(short)
+
+            df = pl.concat([short, long], how="diagonal_relaxed")
+            if len(df):
+                frames.append(df)
+
+        if not frames:
+            return pl.DataFrame(
+                schema={
+                    "labels": pl.Int64,
+                    "coeffs": pl.Float64,
+                    "vars": pl.Int64,
+                    "sign": pl.Utf8,
+                    "rhs": pl.Float64,
+                }
+            )
+
+        df = pl.concat(frames).sort(["labels", "rhs"])
+        is_non_null = df["rhs"].is_not_null()
+        prev_non_is_null = is_non_null.shift(1).fill_null(False)
+        df = df.filter(is_non_null & ~prev_non_is_null | ~is_non_null)
+        name = self.name if self._data is not None else ""
+        check_has_nulls_polars(df, name=f"{self.type} {name}")
         return df[["labels", "coeffs", "vars", "sign", "rhs"]]
 
     # Wrapped function which would convert variable to dataarray
@@ -928,10 +1053,19 @@ class Constraints:
         Filter out terms with zero and close-to-zero coefficient.
         """
         for name in self:
-            not_zero = abs(self[name].coeffs) > 1e-10
             con = self[name]
-            con.vars = self[name].vars.where(not_zero, -1)
-            con.coeffs = self[name].coeffs.where(not_zero)
+            if con._lazy_parts:
+                for i, part in enumerate(con._lazy_parts):
+                    not_zero = abs(part.coeffs) > 1e-10
+                    con._lazy_parts[i] = assign_multiindex_safe(
+                        part,
+                        vars=part.vars.where(not_zero, -1),
+                        coeffs=part.coeffs.where(not_zero),
+                    )
+            else:
+                not_zero = abs(con.coeffs) > 1e-10
+                con.vars = con.vars.where(not_zero, -1)
+                con.coeffs = con.coeffs.where(not_zero)
 
     def sanitize_missings(self) -> None:
         """
@@ -940,9 +1074,16 @@ class Constraints:
         """
         for name in self:
             con = self[name]
-            contains_non_missing = (con.vars != -1).any(con.term_dim)
-            labels = self[name].labels.where(contains_non_missing, -1)
-            con._data = assign_multiindex_safe(con.data, labels=labels)
+            if con._lazy_parts:
+                for i, part in enumerate(con._lazy_parts):
+                    term_dim = [d for d in part.vars.dims if d.startswith("_term")][0]
+                    contains_non_missing = (part.vars != -1).any(term_dim)
+                    labels = part.labels.where(contains_non_missing, -1)
+                    con._lazy_parts[i] = assign_multiindex_safe(part, labels=labels)
+            else:
+                contains_non_missing = (con.vars != -1).any(con.term_dim)
+                labels = con.labels.where(contains_non_missing, -1)
+                con._data = assign_multiindex_safe(con.data, labels=labels)
 
     def sanitize_infinities(self) -> None:
         """
@@ -950,11 +1091,19 @@ class Constraints:
         """
         for name in self:
             con = self[name]
-            valid_infinity_values = ((con.sign == LESS_EQUAL) & (con.rhs == np.inf)) | (
-                (con.sign == GREATER_EQUAL) & (con.rhs == -np.inf)
-            )
-            labels = con.labels.where(~valid_infinity_values, -1)
-            con._data = assign_multiindex_safe(con.data, labels=labels)
+            if con._lazy_parts:
+                for i, part in enumerate(con._lazy_parts):
+                    valid = ((part.sign == LESS_EQUAL) & (part.rhs == np.inf)) | (
+                        (part.sign == GREATER_EQUAL) & (part.rhs == -np.inf)
+                    )
+                    labels = part.labels.where(~valid, -1)
+                    con._lazy_parts[i] = assign_multiindex_safe(part, labels=labels)
+            else:
+                valid_infinity_values = (
+                    (con.sign == LESS_EQUAL) & (con.rhs == np.inf)
+                ) | ((con.sign == GREATER_EQUAL) & (con.rhs == -np.inf))
+                labels = con.labels.where(~valid_infinity_values, -1)
+                con._data = assign_multiindex_safe(con.data, labels=labels)
 
     def get_name_by_label(self, label: int | float) -> str:
         """
