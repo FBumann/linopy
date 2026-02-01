@@ -89,6 +89,13 @@ def build_dispatch_model(n_groups: int, n_plants: int, n_timesteps: int) -> Mode
         total_cost = total_cost + c
     m.add_objective(total_cost)
 
+    # Write LP file — this is what solve() does for file-based solvers.
+    # Ensures we measure the full pipeline including any deferred materialization.
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".lp", delete=True) as f:
+        m.to_file(f.name)
+
     return m
 
 
