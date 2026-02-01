@@ -13,6 +13,7 @@ from xarray.core.coordinates import DataArrayCoordinates, DatasetCoordinates
 if TYPE_CHECKING:
     from linopy.constraints import AnonymousScalarConstraint, Constraint
     from linopy.expressions import (
+        DeferredLinearExpression,
         LinearExpression,
         QuadraticExpression,
         ScalarLinearExpression,
@@ -45,6 +46,7 @@ ExpressionLike = Union[
     "ScalarLinearExpression",
     "LinearExpression",
     "QuadraticExpression",
+    "DeferredLinearExpression",
 ]
 ConstraintLike = Union["Constraint", "AnonymousScalarConstraint"]
 MaskLike = Union[numpy.ndarray, DataArray, Series, DataFrame]  # noqa: UP007

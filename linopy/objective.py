@@ -178,6 +178,9 @@ class Objective:
         if isinstance(expr, list | tuple):
             expr = self.model.linexpr(*expr)
 
+        if isinstance(expr, expressions.DeferredLinearExpression):
+            expr = expr.materialize()
+
         if not isinstance(
             expr, expressions.LinearExpression | expressions.QuadraticExpression
         ):

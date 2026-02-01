@@ -130,8 +130,10 @@ def exprwrap(
 
 
 def _expr_unwrap(
-    maybe_expr: Any | LinearExpression | QuadraticExpression,
+    maybe_expr: Any | LinearExpression | QuadraticExpression | DeferredLinearExpression,
 ) -> Any:
+    if isinstance(maybe_expr, DeferredLinearExpression):
+        return maybe_expr.materialize().data
     if isinstance(maybe_expr, LinearExpression | QuadraticExpression):
         return maybe_expr.data
 
@@ -1293,8 +1295,9 @@ class LinearExpression(BaseExpression):
         | VariableLike
         | ScalarLinearExpression
         | LinearExpression
-        | QuadraticExpression,
-    ) -> LinearExpression | QuadraticExpression:
+        | QuadraticExpression
+        | DeferredLinearExpression,
+    ) -> LinearExpression | QuadraticExpression | DeferredLinearExpression:
         """
         Add an expression to others.
 
@@ -1304,12 +1307,79 @@ class LinearExpression(BaseExpression):
         if isinstance(other, QuadraticExpression):
             return other.__add__(self)
 
+        if isinstance(other, DeferredLinearExpression):
+            return DeferredLinearExpression([self] + other._parts, self.model)
+
         try:
             if np.isscalar(other):
                 return self.assign(const=self.const + other)
 
             other = as_expression(other, model=self.model, dims=self.coord_dims)
+
+            if isinstance(other, LinearExpression):
+                # Check if shapes are identical (same coord dims and sizes)
+                self_coord = {
+                    k: v for k, v in self.sizes.items() if k not in HELPER_DIMS
+                }
+                other_coord = {
+                    k: v for k, v in other.sizes.items() if k not in HELPER_DIMS
+                }
+                if self_coord == other_coord:
+                    # Same shape — use fast merge
+                    return merge([self, other], cls=self.__class__)
+                else:
+                    # Different shape — defer
+                    return DeferredLinearExpression([self, other], self.model)
+
             return merge([self, other], cls=self.__class__)
+        except TypeError:
+            return NotImplemented
+
+    def __iadd__(self, other: SideLike) -> LinearExpression | DeferredLinearExpression:
+        """
+        In-place add: extend _term dimension without full merge when possible.
+        """
+        if isinstance(other, QuadraticExpression):
+            return NotImplemented
+
+        if isinstance(other, DeferredLinearExpression):
+            return DeferredLinearExpression([self] + other._parts, self.model)
+
+        try:
+            if np.isscalar(other):
+                self._data = assign_multiindex_safe(self.data, const=self.const + other)
+                return self
+
+            other = as_expression(other, model=self.model, dims=self.coord_dims)
+
+            # Fast path: same coord dims and sizes, extend _term in-place
+            self_coord = {k: v for k, v in self.sizes.items() if k not in HELPER_DIMS}
+            other_coord = {k: v for k, v in other.sizes.items() if k not in HELPER_DIMS}
+            if self_coord == other_coord:
+                new_coeffs = np.concatenate(
+                    [self.coeffs.values, other.coeffs.values], axis=-1
+                )
+                new_vars = np.concatenate(
+                    [self.vars.values, other.vars.values], axis=-1
+                )
+                coord_dims = list(self_coord.keys())
+                all_dims = coord_dims + [TERM_DIM]
+                coords = {
+                    d: self.data.coords[d] for d in coord_dims if d in self.data.coords
+                }
+                self._data = xr.Dataset(
+                    {
+                        "coeffs": xr.DataArray(
+                            new_coeffs, dims=all_dims, coords=coords
+                        ),
+                        "vars": xr.DataArray(new_vars, dims=all_dims, coords=coords),
+                        "const": self.const + other.const,
+                    }
+                )
+                return self
+
+            # Different shape — return deferred
+            return DeferredLinearExpression([self, other], self.model)
         except TypeError:
             return NotImplemented
 
@@ -2037,7 +2107,9 @@ def as_expression(
     ValueError
         If object cannot be converted to LinearExpression.
     """
-    if isinstance(obj, LinearExpression | QuadraticExpression):
+    if isinstance(
+        obj, LinearExpression | QuadraticExpression | DeferredLinearExpression
+    ):
         return obj
     elif isinstance(obj, variables.Variable | variables.ScalarVariable):
         return obj.to_linexpr()
@@ -2047,6 +2119,53 @@ def as_expression(
         except ValueError as e:
             raise ValueError("Cannot convert to LinearExpression") from e
         return LinearExpression(obj, model)
+
+
+def _merge_same_shape(data: list[Dataset]) -> Dataset:
+    """
+    Fast-path merge for expressions with identical coordinate dimensions.
+
+    Pre-allocates output arrays and copies each expression's data into its
+    _term slice, avoiding xr.concat overhead and intermediate copies.
+    """
+    template = data[0]
+    coord_dims = [d for d in template.dims if d not in HELPER_DIMS]
+    coord_shape = tuple(template.sizes[d] for d in coord_dims)
+    total_terms = sum(d.sizes.get(TERM_DIM, 0) for d in data)
+
+    out_coeffs = np.full((*coord_shape, total_terms), np.nan)
+    out_vars = np.full((*coord_shape, total_terms), -1, dtype=int)
+
+    offset = 0
+    const_sum = data[0]["const"].copy(deep=True) * 0
+    for d in data:
+        n = d.sizes.get(TERM_DIM, 0)
+        if n > 0:
+            out_coeffs[..., offset : offset + n] = d["coeffs"].values
+            out_vars[..., offset : offset + n] = d["vars"].values
+        offset += n
+        const_sum = const_sum + d["const"]
+
+    all_dims = list(coord_dims) + [TERM_DIM]
+    coords = {d: template.coords[d] for d in coord_dims if d in template.coords}
+    return xr.Dataset(
+        {
+            "coeffs": xr.DataArray(out_coeffs, dims=all_dims, coords=coords),
+            "vars": xr.DataArray(out_vars, dims=all_dims, coords=coords),
+            "const": const_sum,
+        }
+    )
+
+
+def _merge_term_dim_concat(data: list[Dataset], kwargs: dict[str, Any]) -> Dataset:
+    """
+    Merge expressions along _term dimension using xr.concat (original path).
+    """
+    ds = xr.concat([d[["coeffs", "vars"]] for d in data], TERM_DIM, **kwargs)
+    subkwargs = {**kwargs, "fill_value": 0}
+    const = xr.concat([d["const"] for d in data], TERM_DIM, **subkwargs).sum(TERM_DIM)
+    ds = assign_multiindex_safe(ds, const=const)
+    return ds
 
 
 def merge(
@@ -2137,11 +2256,23 @@ def merge(
         else:
             kwargs.setdefault("join", "outer")
 
-    if dim == TERM_DIM:
-        ds = xr.concat([d[["coeffs", "vars"]] for d in data], dim, **kwargs)
-        subkwargs = {**kwargs, "fill_value": 0}
-        const = xr.concat([d["const"] for d in data], dim, **subkwargs).sum(TERM_DIM)
-        ds = assign_multiindex_safe(ds, const=const)
+    # Check if all expressions have exactly the same coord dims and sizes
+    _same_shape = (
+        dim == TERM_DIM
+        and override
+        and cls == LinearExpression
+        and len(data) > 1
+        and all(
+            {k: v for k, v in d.sizes.items() if k not in HELPER_DIMS}
+            == {k: v for k, v in data[0].sizes.items() if k not in HELPER_DIMS}
+            for d in data[1:]
+        )
+    )
+    if _same_shape:
+        # Fast path: all expressions have same coord dims, pre-allocate
+        ds = _merge_same_shape(data)
+    elif dim == TERM_DIM:
+        ds = _merge_term_dim_concat(data, kwargs)
     elif dim == FACTOR_DIM:
         ds = xr.concat([d[["vars"]] for d in data], dim, **kwargs)
         coeffs = xr.concat([d["coeffs"] for d in data], dim, **kwargs).prod(FACTOR_DIM)
@@ -2154,6 +2285,212 @@ def merge(
         ds = ds.reset_index(d, drop=True)
 
     return cls(ds, model)
+
+
+class DeferredLinearExpression:
+    """
+    Lazy container that stores LinearExpression parts without merging.
+
+    When adding expressions with disjoint coordinates, ``merge()`` creates
+    dense arrays over the union of all coordinates.  DeferredLinearExpression
+    avoids this by storing the parts and only materializing (calling
+    ``merge()``) when an operation actually requires the full xarray Dataset.
+
+    Fast-path outputs like ``.flat`` and ``.to_polars()`` concatenate each
+    part's flat output directly, never creating the dense union array.
+    """
+
+    __slots__ = ("_parts", "_model")
+
+    def __init__(
+        self,
+        parts: list[LinearExpression | DeferredLinearExpression],
+        model: Model,
+    ) -> None:
+        flat_parts: list[LinearExpression] = []
+        for p in parts:
+            if isinstance(p, DeferredLinearExpression):
+                flat_parts.extend(p._parts)
+            else:
+                flat_parts.append(p)
+        self._parts = flat_parts
+        self._model = model
+
+    # ------------------------------------------------------------------
+    # Materialization
+    # ------------------------------------------------------------------
+
+    def materialize(self) -> LinearExpression:
+        """Merge all parts into a single LinearExpression."""
+        if len(self._parts) == 1:
+            return self._parts[0]
+        return merge(self._parts, cls=LinearExpression)
+
+    # ------------------------------------------------------------------
+    # Cheap properties
+    # ------------------------------------------------------------------
+
+    @property
+    def model(self) -> Model:
+        return self._model
+
+    @property
+    def nterm(self) -> int:
+        return sum(p.nterm for p in self._parts)
+
+    @property
+    def const(self) -> DataArray:
+        return self.materialize().const
+
+    # ------------------------------------------------------------------
+    # Lazy arithmetic — return new DeferredLinearExpression
+    # ------------------------------------------------------------------
+
+    def __add__(
+        self,
+        other: ConstantLike
+        | VariableLike
+        | ScalarLinearExpression
+        | LinearExpression
+        | DeferredLinearExpression,
+    ) -> DeferredLinearExpression:
+        if isinstance(other, DeferredLinearExpression):
+            return DeferredLinearExpression(self._parts + other._parts, self._model)
+        if isinstance(other, QuadraticExpression):
+            return NotImplemented
+        try:
+            if np.isscalar(other):
+                # Apply scalar addition to the first part's const only
+                new_first = self._parts[0].assign(const=self._parts[0].const + other)
+                return DeferredLinearExpression(
+                    [new_first] + self._parts[1:], self._model
+                )
+            other = as_expression(other, model=self._model)
+            return DeferredLinearExpression(self._parts + [other], self._model)
+        except TypeError:
+            return NotImplemented
+
+    def __radd__(
+        self, other: ConstantLike | VariableLike | LinearExpression
+    ) -> DeferredLinearExpression:
+        if isinstance(other, int | float | np.number) and other == 0:
+            return self
+        if isinstance(other, LinearExpression):
+            return DeferredLinearExpression([other] + self._parts, self._model)
+        try:
+            return self.__add__(other)
+        except TypeError:
+            return NotImplemented
+
+    def __sub__(
+        self,
+        other: ConstantLike
+        | VariableLike
+        | ScalarLinearExpression
+        | LinearExpression
+        | DeferredLinearExpression,
+    ) -> DeferredLinearExpression:
+        try:
+            return self.__add__(-other)
+        except TypeError:
+            return NotImplemented
+
+    def __rsub__(
+        self, other: ConstantLike | VariableLike | LinearExpression
+    ) -> DeferredLinearExpression:
+        try:
+            return (-self).__add__(other)
+        except TypeError:
+            return NotImplemented
+
+    def __neg__(self) -> DeferredLinearExpression:
+        return DeferredLinearExpression([-p for p in self._parts], self._model)
+
+    def __mul__(self, other: ConstantLike) -> DeferredLinearExpression:
+        if isinstance(
+            other,
+            variables.Variable
+            | variables.ScalarVariable
+            | LinearExpression
+            | ScalarLinearExpression
+            | QuadraticExpression,
+        ):
+            return NotImplemented
+        try:
+            return DeferredLinearExpression(
+                [p * other for p in self._parts], self._model
+            )
+        except TypeError:
+            return NotImplemented
+
+    def __rmul__(self, other: ConstantLike) -> DeferredLinearExpression:
+        return self.__mul__(other)
+
+    def __truediv__(self, other: ConstantLike) -> DeferredLinearExpression:
+        try:
+            return self.__mul__(1 / other)
+        except TypeError:
+            return NotImplemented
+
+    def sum(self, dim: DimsLike | None = None, **kwargs: Any) -> LinearExpression:
+        """Sum the expression. Materializes first to ensure correct broadcasting."""
+        return self.materialize().sum(dim=dim, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Fast-path outputs — NO dense materialization
+    # ------------------------------------------------------------------
+
+    @property
+    def flat(self) -> pd.DataFrame:
+        """Convert to flat DataFrame. Materializes if parts have overlapping semantics."""
+        return self.materialize().flat
+
+    def to_polars(self) -> pl.DataFrame:
+        """Convert to polars DataFrame. Materializes if parts have overlapping semantics."""
+        return self.materialize().to_polars()
+
+    # ------------------------------------------------------------------
+    # Constraint / objective helpers — materialize then delegate
+    # ------------------------------------------------------------------
+
+    def to_constraint(self, sign: SignLike, rhs: SideLike) -> Constraint:
+        return self.materialize().to_constraint(sign, rhs)
+
+    # ------------------------------------------------------------------
+    # Comparison operators — materialize then delegate
+    # ------------------------------------------------------------------
+
+    def __le__(self, other: SideLike) -> Constraint:
+        return self.materialize().__le__(other)
+
+    def __ge__(self, other: SideLike) -> Constraint:
+        return self.materialize().__ge__(other)
+
+    def __eq__(self, other: SideLike) -> Constraint:  # type: ignore
+        return self.materialize().__eq__(other)
+
+    # ------------------------------------------------------------------
+    # Fallback — materialize and delegate
+    # ------------------------------------------------------------------
+
+    @property
+    def data(self) -> Dataset:
+        return self.materialize().data
+
+    def __getitem__(self, key: Any) -> Any:
+        return self.materialize().__getitem__(key)
+
+    def __repr__(self) -> str:
+        return (
+            f"DeferredLinearExpression with {len(self._parts)} parts, "
+            f"total nterm={self.nterm}"
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        # Avoid infinite recursion on _parts / _model
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.materialize(), name)
 
 
 class ScalarLinearExpression:

@@ -44,6 +44,7 @@ from linopy.constants import (
 )
 from linopy.constraints import AnonymousScalarConstraint, Constraint, Constraints
 from linopy.expressions import (
+    DeferredLinearExpression,
     LinearExpression,
     QuadraticExpression,
     ScalarLinearExpression,
@@ -656,6 +657,8 @@ class Model:
         if sign is not None:
             sign = maybe_replace_signs(as_dataarray(sign))
 
+        if isinstance(lhs, DeferredLinearExpression):
+            lhs = lhs.materialize()
         if isinstance(lhs, LinearExpression):
             if sign is None or rhs is None:
                 raise ValueError(msg_sign_rhs_not_none)
@@ -757,6 +760,8 @@ class Model:
                 "Objective already defined."
                 " Set `overwrite` to True to force overwriting."
             )
+        if isinstance(expr, DeferredLinearExpression):
+            expr = expr.materialize()
         if isinstance(expr, Variable):
             expr = 1 * expr
         self.objective.expression = expr
