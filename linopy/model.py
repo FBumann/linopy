@@ -591,6 +591,45 @@ class Model:
 
         variable.attrs.update(sos_type=sos_type, sos_dim=sos_dim)
 
+    def _label_constraint_dataset(
+        self, ds: Dataset, name: str, start: int, mask: MaskLike | None = None
+    ) -> tuple[Dataset, int]:
+        """
+        Assign sequential labels to a constraint dataset.
+
+        Performs infinity check, drops helper dims, broadcasts, assigns label
+        range, applies mask, and chunks. Returns ``(ds, next_start)``.
+        """
+        invalid_infinity_values = ((ds.sign == LESS_EQUAL) & (ds.rhs == -np.inf)) | (
+            (ds.sign == GREATER_EQUAL) & (ds.rhs == np.inf)
+        )
+        if invalid_infinity_values.any():
+            raise ValueError(f"Constraint {name} contains incorrect infinite values.")
+
+        if drop_dims := set(HELPER_DIMS).intersection(ds.coords):
+            ds = ds.drop_vars(drop_dims)
+
+        ds["labels"] = -1
+        (ds,) = xr.broadcast(ds, exclude=[TERM_DIM])
+
+        self.check_force_dim_names(ds)
+
+        n = ds.labels.size
+        ds.labels.values = np.arange(start, start + n).reshape(ds.labels.shape)
+
+        if mask is not None:
+            m = as_dataarray(mask).astype(bool)
+            assert set(m.dims).issubset(ds.dims), (
+                "Dimensions of mask not a subset of resulting labels dimensions."
+            )
+            ds.labels.values = ds.labels.where(m, -1).values
+
+        if self.chunk:
+            ds = ds.chunk(self.chunk)
+
+        ds = ds.assign_attrs(label_range=(start, start + n), name=name)
+        return ds, start + n
+
     def add_constraints(
         self,
         lhs: VariableLike
@@ -656,73 +695,64 @@ class Model:
         if sign is not None:
             sign = maybe_replace_signs(as_dataarray(sign))
 
+        con: Constraint | None = None
         if isinstance(lhs, LinearExpression):
             if sign is None or rhs is None:
                 raise ValueError(msg_sign_rhs_not_none)
-            data = lhs.to_constraint(sign, rhs).data
+            con = lhs.to_constraint(sign, rhs)
         elif isinstance(lhs, list | tuple):
             if sign is None or rhs is None:
                 raise ValueError(msg_sign_rhs_none)
-            data = self.linexpr(*lhs).to_constraint(sign, rhs).data
+            con = self.linexpr(*lhs).to_constraint(sign, rhs)
         # directly convert first argument to a constraint
         elif callable(lhs):
             assert coords is not None, "`coords` must be given when lhs is a function"
             rule = lhs
             if sign is not None or rhs is not None:
                 raise ValueError(msg_sign_rhs_none)
-            data = Constraint.from_rule(self, rule, coords).data
+            con = Constraint.from_rule(self, rule, coords)
         elif isinstance(lhs, AnonymousScalarConstraint):
             if sign is not None or rhs is not None:
                 raise ValueError(msg_sign_rhs_none)
-            data = lhs.to_constraint().data
+            con = lhs.to_constraint()
         elif isinstance(lhs, Constraint):
             if sign is not None or rhs is not None:
                 raise ValueError(msg_sign_rhs_none)
-            data = lhs.data
+            con = lhs
         elif isinstance(lhs, Variable | ScalarVariable | ScalarLinearExpression):
             if sign is None or rhs is None:
                 raise ValueError(msg_sign_rhs_not_none)
-            data = lhs.to_linexpr().to_constraint(sign, rhs).data
+            con = lhs.to_linexpr().to_constraint(sign, rhs)
         else:
             raise ValueError(
                 f"Invalid type of `lhs` ({type(lhs)}) or invalid combination of `lhs`, `sign` and `rhs`."
             )
 
-        invalid_infinity_values = (
-            (data.sign == LESS_EQUAL) & (data.rhs == -np.inf)
-        ) | ((data.sign == GREATER_EQUAL) & (data.rhs == np.inf))  # noqa: F821
-        if invalid_infinity_values.any():
-            raise ValueError(f"Constraint {name} contains incorrect infinite values.")
+        # Lazy constraint path: per-part label assignment
+        if con._lazy_parts is not None:
+            range_start = self._cCounter
+            start = range_start
+            labeled_parts: list[Dataset] = []
+            for part in con._lazy_parts:
+                part, start = self._label_constraint_dataset(part, name, start, mask)
+                labeled_parts.append(part)
 
-        # ensure helper dimensions are not set as coordinates
-        if drop_dims := set(HELPER_DIMS).intersection(data.coords):
-            # TODO: add a warning here, routines should be safe against this
-            data = data.drop_vars(drop_dims)
-
-        data["labels"] = -1
-        (data,) = xr.broadcast(data, exclude=[TERM_DIM])
-
-        if mask is not None:
-            mask = as_dataarray(mask).astype(bool)
-            # TODO: simplify
-            assert set(mask.dims).issubset(data.dims), (
-                "Dimensions of mask not a subset of resulting labels dimensions."
+            self._cCounter = start
+            constraint = Constraint(
+                None,
+                name=name,
+                model=self,
+                lazy_parts=labeled_parts,
             )
+            # Store overall label_range for get_name_by_label
+            constraint._label_range = (range_start, start)
+            self.constraints.add(constraint)
+            return constraint
 
-        self.check_force_dim_names(data)
-
-        start = self._cCounter
-        end = start + data.labels.size
-        data.labels.values = np.arange(start, end).reshape(data.labels.shape)
-        self._cCounter += data.labels.size
-
-        if mask is not None:
-            data.labels.values = data.labels.where(mask, -1).values
-
-        data = data.assign_attrs(label_range=(start, end), name=name)
-
-        if self.chunk:
-            data = data.chunk(self.chunk)
+        # Standard (non-lazy) path
+        data = con.data
+        data, end = self._label_constraint_dataset(data, name, self._cCounter, mask)
+        self._cCounter = end
 
         constraint = Constraint(data, name=name, model=self, skip_broadcast=True)
         self.constraints.add(constraint)

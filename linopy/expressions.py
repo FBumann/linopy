@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -869,6 +870,11 @@ class BaseExpression(ABC):
                 f"Both sides of the constraint are constant. At least one side must contain variables. {self} {rhs}"
             )
 
+        # If rhs is a LazyLinearExpression, delegate to its to_constraint
+        # so the lazy paths (coord-disjoint, redistribute) can be tried.
+        if isinstance(rhs, LazyLinearExpression) and rhs.is_lazy:
+            return (self - rhs).to_constraint(sign, 0)
+
         all_to_lhs = (self - rhs).data
         data = assign_multiindex_safe(
             all_to_lhs[["coeffs", "vars"]], sign=sign, rhs=-all_to_lhs.const
@@ -1265,7 +1271,7 @@ class LinearExpression(BaseExpression):
 
     >>> other = 4 * y
     >>> type(expr + other)
-    <class 'linopy.expressions.LinearExpression'>
+    <class 'linopy.expressions.LazyLinearExpression'>
 
     Multiplying:
 
@@ -1772,6 +1778,588 @@ class LinearExpression(BaseExpression):
         return LinearExpression(const_da, model)
 
 
+def _parts_are_disjoint(parts: list[Dataset]) -> bool:
+    """Check if all parts have non-empty, mutually disjoint coord dims."""
+    coord_dims = [set(k for k in p.sizes if k not in HELPER_DIMS) for p in parts]
+    if not all(coord_dims):
+        return False
+    for i, di in enumerate(coord_dims):
+        for dj in coord_dims[i + 1 :]:
+            if di & dj:
+                return False
+    return True
+
+
+def _parts_are_coord_disjoint(parts: list[Dataset]) -> bool:
+    """
+    Check if parts have non-overlapping coordinate spaces.
+
+    Two parts are coordinate-disjoint if, for every pair that shares
+    dimension names, at least one shared dimension has completely
+    non-overlapping coordinate values.  All parts must have at least
+    one non-helper dimension (scalars need broadcasting, not slicing).
+    """
+    all_coord_dims = [{k for k in p.sizes if k not in HELPER_DIMS} for p in parts]
+    if not all(all_coord_dims):
+        return False
+    for i, pi in enumerate(parts):
+        dims_i = {k for k in pi.sizes if k not in HELPER_DIMS}
+        for pj in parts[i + 1 :]:
+            dims_j = {k for k in pj.sizes if k not in HELPER_DIMS}
+            shared = dims_i & dims_j
+            if not shared:
+                continue
+            disjoint_on_some_dim = False
+            for d in shared:
+                if d in pi.coords and d in pj.coords:
+                    vals_i = set(pi[d].values.flat)
+                    vals_j = set(pj[d].values.flat)
+                    if not (vals_i & vals_j):
+                        disjoint_on_some_dim = True
+                        break
+            if not disjoint_on_some_dim:
+                return False
+    return True
+
+
+def _try_redistribute(parts: list[Dataset]) -> list[Dataset] | None:
+    """
+    Redistribute parts so a broad part is sliced into coord-disjoint pieces.
+
+    When one part spans the full coordinate space (e.g. a variable with all
+    contributors × effects × time) and the remaining parts cover disjoint
+    subsets, this slices the broad part to each narrow part's coordinates
+    and concatenates along ``_term``.  The result is a list of parts that
+    are coordinate-disjoint and can be used in the lazy constraint path.
+    """
+    if len(parts) <= 1:
+        return None
+
+    coord_dims_per = [{k for k in p.sizes if k not in HELPER_DIMS} for p in parts]
+    # All parts must share the same coord dims
+    if len(set(frozenset(d) for d in coord_dims_per)) != 1:
+        return None
+    coord_dims = coord_dims_per[0]
+    if not coord_dims:
+        return None
+
+    # Find broadest part by total element count; must be strictly largest
+    sizes = [math.prod(p.sizes[d] for d in coord_dims) for p in parts]
+    max_size = max(sizes)
+    if sizes.count(max_size) != 1:
+        return None  # multiple parts with same max size → no clear broad part
+    broad_idx = sizes.index(max_size)
+    broad = parts[broad_idx]
+    narrow_parts = [p for i, p in enumerate(parts) if i != broad_idx]
+
+    if not narrow_parts:
+        return None
+
+    # Narrow parts must be pairwise coord-disjoint
+    if not _parts_are_coord_disjoint(narrow_parts):
+        return None
+
+    # Tiling check: narrow parts must perfectly tile the broad part
+    broad_total = sizes[broad_idx]
+    narrow_total = sum(math.prod(p.sizes[d] for d in coord_dims) for p in narrow_parts)
+    for dim in coord_dims:
+        broad_vals = set(broad[dim].values.flat)
+        narrow_vals: set = set()
+        for n in narrow_parts:
+            if dim in n.coords:
+                narrow_vals |= set(n[dim].values.flat)
+        if not narrow_vals >= broad_vals:
+            return None
+    if narrow_total != broad_total:
+        # Cross-product gaps → fall back
+        return None
+
+    # Redistribute: slice broad into each narrow's coordinate space
+    enriched: list[Dataset] = []
+    for n in narrow_parts:
+        sel_dict = {}
+        for dim in coord_dims:
+            if dim in n.coords and dim in broad.coords:
+                sel_dict[dim] = n[dim]
+        sliced = broad.sel(sel_dict) if sel_dict else broad
+        combined = xr.concat(
+            [n, sliced],
+            TERM_DIM,
+            coords="minimal",
+            compat="override",
+            join="override",
+            fill_value=FILL_VALUE,
+        )
+        for d in set(HELPER_DIMS) & set(combined.coords):
+            combined = combined.reset_index(d, drop=True)
+        enriched.append(combined)
+
+    return enriched
+
+
+class LazyLinearExpression(LinearExpression):
+    """
+    A LinearExpression that defers merge along _term.
+
+    Instead of concatenating datasets immediately (which triggers dense
+    outer-join padding in xarray), this class stores a list of compact
+    per-expression datasets.  Materialization into a single dense Dataset
+    happens lazily on first access to ``.data`` so that all existing code
+    paths work unchanged.  The speedup comes from overriding the ``flat``
+    property (the solver hot-path) to iterate parts directly, avoiding the
+    dense padding entirely.
+    """
+
+    __slots__ = ("_parts", "_const_override")
+
+    def __init__(
+        self,
+        data_or_parts: Dataset | list[Dataset],
+        model: Model,
+        *,
+        parts: list[Dataset] | None = None,
+        const: DataArray | None = None,
+    ) -> None:
+        # Normal LinearExpression construction (e.g. from exprwrap fallback)
+        if parts is None and not isinstance(data_or_parts, list):
+            super().__init__(data_or_parts, model)
+            self._parts: list[Dataset] = []
+            self._const_override = None
+            return
+
+        # Lazy construction: store parts, defer materialization
+        if parts is not None:
+            part_list = parts
+        else:
+            part_list = data_or_parts  # type: ignore[assignment]
+
+        object.__setattr__(self, "_parts", part_list)
+        object.__setattr__(self, "_const_override", const)
+        object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_data", None)  # lazy
+
+    @property
+    def data(self) -> Dataset:
+        if self._data is None:
+            object.__setattr__(self, "_data", self._materialize())
+            object.__setattr__(self, "_const_override", None)
+        return self._data
+
+    @property
+    def const(self) -> DataArray:
+        if self._const_override is not None:
+            if self.is_lazy and self._const_override.ndim == 0 and self._parts:
+                # Broadcast scalar const to match parts' coord dims.
+                # Use the first part's dims as reference — this is correct
+                # when parts share the same coord space (common case).
+                # For disjoint dims, materialization is needed for full const.
+                ref = self._parts[0]
+                coord_sizes = {
+                    k: v for k, v in ref.sizes.items() if k not in HELPER_DIMS
+                }
+                if coord_sizes:
+                    return self._const_override.broadcast_like(
+                        xr.DataArray(
+                            np.zeros(list(coord_sizes.values())),
+                            dims=list(coord_sizes.keys()),
+                        )
+                    )
+            return self._const_override
+        return self.data.const
+
+    @const.setter
+    def const(self, value: DataArray) -> None:
+        object.__setattr__(self, "_const_override", None)
+        self._data = assign_multiindex_safe(self.data, const=value)
+
+    @property
+    def is_lazy(self) -> bool:
+        """True if the expression has not been materialized yet."""
+        return self._data is None and len(self._parts) > 0
+
+    def _materialize(self) -> Dataset:
+        """Fall back to the standard dense merge."""
+        if not self._parts:
+            raise ValueError("LazyLinearExpression has no parts to materialize")
+
+        # Detect if all parts share the same coordinate space
+        coord_dims = [
+            {k: v for k, v in p.sizes.items() if k not in HELPER_DIMS}
+            for p in self._parts
+        ]
+        override = check_common_keys_values(coord_dims)  # type: ignore[arg-type]
+
+        kwargs: dict[str, Any] = {
+            "coords": "minimal",
+            "compat": "override",
+            "join": "override" if override else "outer",
+            "fill_value": FILL_VALUE,
+        }
+        ds = xr.concat(self._parts, TERM_DIM, **kwargs)
+
+        for d in set(HELPER_DIMS) & set(ds.coords):
+            ds = ds.reset_index(d, drop=True)
+
+        if self._const_override is not None:
+            ds = assign_multiindex_safe(ds, const=self._const_override)
+        else:
+            ds = ds.assign(const=0.0)
+
+        # Normalize: transpose so _term is last, broadcast coord dims
+        ds = Dataset(ds.transpose(..., TERM_DIM))
+        (ds,) = xr.broadcast(ds, exclude=HELPER_DIMS)
+
+        return ds
+
+    @property
+    def flat(self) -> pd.DataFrame:
+        """
+        Convert the expression to a pandas DataFrame without materializing.
+
+        Each part is converted independently and the results are concatenated,
+        avoiding the dense outer-join padding entirely.
+        """
+        if not self.is_lazy:
+            return super().flat
+
+        frames = []
+        for part in self._parts:
+
+            def mask_func(
+                datadict: dict[Hashable, np.ndarray],
+            ) -> pd.Series:
+                return (datadict["vars"] != -1) & (datadict["coeffs"] != 0)
+
+            df = to_dataframe(part, mask_func=mask_func)
+            if len(df):
+                frames.append(df)
+
+        if not frames:
+            return pd.DataFrame(
+                {"coeffs": pd.Series(dtype=float), "vars": pd.Series(dtype=int)}
+            )
+
+        df = pd.concat(frames, ignore_index=True)
+        df = df.groupby("vars", as_index=False).sum()
+        check_has_nulls(df, name=self.type)
+        return df
+
+    def __add__(  # type: ignore[override]
+        self,
+        other: ConstantLike
+        | VariableLike
+        | ScalarLinearExpression
+        | LinearExpression
+        | QuadraticExpression,
+    ) -> LinearExpression | QuadraticExpression:
+        if not self.is_lazy:
+            return super().__add__(other)
+
+        if isinstance(other, QuadraticExpression):
+            return other.__add__(self)
+
+        try:
+            if np.isscalar(other):
+                const = (
+                    self._const_override
+                    if self._const_override is not None
+                    else xr.DataArray(0.0)
+                )
+                return LazyLinearExpression(
+                    None,  # type: ignore[arg-type]
+                    self._model,
+                    parts=list(self._parts),
+                    const=const + other,
+                )
+
+            if isinstance(other, LazyLinearExpression) and other.is_lazy:
+                # Merge parts lists
+                const_self = (
+                    self._const_override
+                    if self._const_override is not None
+                    else xr.DataArray(0.0)
+                )
+                const_other = (
+                    other._const_override
+                    if other._const_override is not None
+                    else xr.DataArray(0.0)
+                )
+                aligned_self, aligned_other = xr.align(
+                    const_self, const_other, join="outer", fill_value=0
+                )
+                return LazyLinearExpression(
+                    None,  # type: ignore[arg-type]
+                    self._model,
+                    parts=self._parts + other._parts,
+                    const=aligned_self + aligned_other,
+                )
+
+            # For LinearExpression/Variable, use merge directly to avoid
+            # materializing self via coord_dims access in super().__add__
+            other = as_expression(other, model=self._model)
+            return merge([self, other])
+        except TypeError:
+            return NotImplemented
+
+    def __neg__(self) -> LinearExpression:  # type: ignore[override]
+        if not self.is_lazy:
+            return super().__neg__()
+        neg_parts = [assign_multiindex_safe(p, coeffs=-p.coeffs) for p in self._parts]
+        const = (
+            self._const_override
+            if self._const_override is not None
+            else xr.DataArray(0.0)
+        )
+        return LazyLinearExpression(
+            None,  # type: ignore[arg-type]
+            self._model,
+            parts=neg_parts,
+            const=-const,
+        )
+
+    def __sub__(  # type: ignore[override]
+        self,
+        other: ConstantLike
+        | VariableLike
+        | ScalarLinearExpression
+        | LinearExpression
+        | QuadraticExpression,
+    ) -> LinearExpression | QuadraticExpression:
+        if not self.is_lazy:
+            return super().__sub__(other)
+        try:
+            return self.__add__(-other)
+        except TypeError:
+            return NotImplemented
+
+    def _compact(self) -> LazyLinearExpression:
+        """
+        Merge parts that share the same coordinate space.
+
+        Groups parts by their non-helper dimension signature and merges
+        each group with ``join="override"`` (cheap, no padding).  This
+        keeps the part count low after many chained additions.
+        """
+        if not self.is_lazy or len(self._parts) <= 1:
+            return self
+
+        from itertools import groupby
+
+        def _coord_key(p: Dataset) -> tuple:
+            return tuple(
+                sorted((k, v) for k, v in p.sizes.items() if k not in HELPER_DIMS)
+            )
+
+        sorted_parts = sorted(self._parts, key=_coord_key)
+        merged: list[Dataset] = []
+        for _key, group in groupby(sorted_parts, key=_coord_key):
+            group_list = list(group)
+            if len(group_list) == 1:
+                merged.append(group_list[0])
+            else:
+                ds = xr.concat(
+                    group_list,
+                    TERM_DIM,
+                    coords="minimal",
+                    compat="override",
+                    join="override",
+                    fill_value=FILL_VALUE,
+                )
+                for d in set(HELPER_DIMS) & set(ds.coords):
+                    ds = ds.reset_index(d, drop=True)
+                merged.append(ds)
+
+        return LazyLinearExpression(
+            None,  # type: ignore[arg-type]
+            self._model,
+            parts=merged,
+            const=self._const_override,
+        )
+
+    def to_constraint(self, sign: SignLike, rhs: SideLike) -> Constraint:
+        """Build constraint per-part to avoid Cartesian-product materialization."""
+        if not self.is_lazy:
+            return super().to_constraint(sign, rhs)
+
+        # Compute lhs = self - rhs (stays lazy for scalar/constant rhs)
+        lhs = self - rhs
+        if not (isinstance(lhs, LazyLinearExpression) and lhs.is_lazy):
+            # Fell back to non-lazy, use standard path
+            return LinearExpression.to_constraint(lhs, sign, 0)
+
+        # Only use lazy constraint path when ALL parts have non-empty,
+        # mutually disjoint coord dims. When parts share coords or have
+        # empty dims (scalars), they must be merged so each constraint
+        # label spans all terms at the same coordinate.
+        if _parts_are_disjoint(lhs._parts):
+            # Build per-part constraint datasets
+            # Use raw _const_override (scalar) to avoid broadcasting across
+            # disjoint dimensions when assigning rhs to each part
+            raw_const = (
+                lhs._const_override
+                if lhs._const_override is not None
+                else xr.DataArray(0.0)
+            )
+            rhs_val = -raw_const
+            constraint_parts: list[Dataset] = []
+            for part in lhs._parts:
+                ds = assign_multiindex_safe(
+                    part[["coeffs", "vars"]], sign=sign, rhs=rhs_val
+                )
+                constraint_parts.append(ds)
+
+            return constraints.Constraint(
+                None, model=self.model, lazy_parts=constraint_parts
+            )
+
+        # Parts share dimension names but may be disjoint by coordinate values
+        if _parts_are_coord_disjoint(lhs._parts):
+            raw_const = (
+                lhs._const_override
+                if lhs._const_override is not None
+                else xr.DataArray(0.0)
+            )
+            rhs_val = -raw_const
+            constraint_parts_cd: list[Dataset] = []
+            for part in lhs._parts:
+                part_rhs = rhs_val
+                if isinstance(rhs_val, xr.DataArray) and rhs_val.dims:
+                    sel = {
+                        d: part[d]
+                        for d in rhs_val.dims
+                        if d in part.coords and d not in HELPER_DIMS
+                    }
+                    if sel:
+                        part_rhs = rhs_val.sel(sel)
+                ds = assign_multiindex_safe(
+                    part[["coeffs", "vars"]], sign=sign, rhs=part_rhs
+                )
+                constraint_parts_cd.append(ds)
+
+            return constraints.Constraint(
+                None, model=self.model, lazy_parts=constraint_parts_cd
+            )
+
+        # Try redistribute: slice a broad part across coord-disjoint narrows
+        # Use raw parts (not compacted) because _compact merges same-shape
+        # parts with different coordinates, destroying the tiling structure.
+        redistributed = _try_redistribute(lhs._parts)
+        if redistributed is not None:
+            raw_const = (
+                lhs._const_override
+                if lhs._const_override is not None
+                else xr.DataArray(0.0)
+            )
+            rhs_val = -raw_const
+            constraint_parts_rd: list[Dataset] = []
+            for part in redistributed:
+                part_rhs = rhs_val
+                if isinstance(rhs_val, xr.DataArray) and rhs_val.dims:
+                    sel = {
+                        d: part[d]
+                        for d in rhs_val.dims
+                        if d in part.coords and d not in HELPER_DIMS
+                    }
+                    if sel:
+                        part_rhs = rhs_val.sel(sel)
+                ds = assign_multiindex_safe(
+                    part[["coeffs", "vars"]], sign=sign, rhs=part_rhs
+                )
+                constraint_parts_rd.append(ds)
+
+            return constraints.Constraint(
+                None, model=self.model, lazy_parts=constraint_parts_rd
+            )
+
+        # Fall back to materialization
+        return LinearExpression.to_constraint(lhs, sign, 0)
+
+    def to_polars(self) -> pl.DataFrame:
+        """Convert the expression to a polars DataFrame without materializing."""
+        if not self.is_lazy:
+            return super().to_polars()
+
+        frames = []
+        for part in self._parts:
+            df = to_polars(part)
+            df = filter_nulls_polars(df)
+            if len(df):
+                frames.append(df)
+
+        if not frames:
+            return pl.DataFrame(
+                {
+                    "vars": pl.Series([], dtype=pl.Int64),
+                    "coeffs": pl.Series([], dtype=pl.Float64),
+                }
+            )
+
+        df = pl.concat(frames)
+        df = group_terms_polars(df)
+        check_has_nulls_polars(df, name=self.type)
+        return df
+
+    def sel(self, *args: Any, **kwargs: Any) -> LazyLinearExpression | LinearExpression:
+        """Apply sel to each part independently."""
+        if not self.is_lazy:
+            return super().sel(*args, **kwargs)
+        # Materialize — sel semantics with indexers may not apply cleanly per-part
+        return LinearExpression.sel(self, *args, **kwargs)
+
+    def rename(
+        self, *args: Any, **kwargs: Any
+    ) -> LazyLinearExpression | LinearExpression:
+        """Apply rename to each part independently, skipping parts that lack the dim."""
+        if not self.is_lazy:
+            return super().rename(*args, **kwargs)
+        # Build the name mapping
+        from xarray.core.utils import either_dict_or_kwargs
+
+        name_dict = either_dict_or_kwargs(args[0] if args else {}, kwargs, "rename")
+        new_parts = []
+        for p in self._parts:
+            # Only rename dims/vars that exist in this part
+            applicable = {k: v for k, v in name_dict.items() if k in p or k in p.dims}
+            new_parts.append(p.rename(applicable) if applicable else p)
+        const = self._const_override
+        if const is not None:
+            applicable = {k: v for k, v in name_dict.items() if k in const.dims}
+            if applicable:
+                const = const.rename(applicable)
+        return LazyLinearExpression(
+            None,  # type: ignore[arg-type]
+            self._model,
+            parts=new_parts,
+            const=const,
+        )
+
+    def shift(
+        self, *args: Any, **kwargs: Any
+    ) -> LazyLinearExpression | LinearExpression:
+        """Apply shift to each part independently."""
+        if not self.is_lazy:
+            return super().shift(*args, **kwargs)
+        # Materialize — shift fill behavior needs consistent coord space
+        return LinearExpression.shift(self, *args, **kwargs)
+
+    def diff(self, dim: str, n: int = 1) -> LazyLinearExpression | LinearExpression:  # type: ignore[override]
+        """Apply diff to each part that contains the dimension."""
+        if not self.is_lazy:
+            return super().diff(dim, n)
+        new_parts = []
+        for p in self._parts:
+            if dim in p.dims:
+                new_parts.append(p.diff(dim, n))
+            else:
+                new_parts.append(p)
+        return LazyLinearExpression(
+            None,  # type: ignore[arg-type]
+            self._model,
+            parts=new_parts,
+            const=self._const_override,
+        )
+
+
 class QuadraticExpression(BaseExpression):
     """
     A quadratic expression consisting of terms of coefficients and variables.
@@ -1875,7 +2463,9 @@ class QuadraticExpression(BaseExpression):
                 return self.assign(const=self.const - other)
 
             other = as_expression(other, model=self.model, dims=self.coord_dims)
-            if type(other) is LinearExpression:
+            if isinstance(other, LinearExpression) and not isinstance(
+                other, QuadraticExpression
+            ):
                 other = other.to_quadexpr()
             return merge([self, -other], cls=self.__class__)
         except TypeError:
@@ -2094,7 +2684,7 @@ def merge(
         exprs = [exprs] + list(add_exprs)  # type: ignore
 
     has_quad_expression = any(type(e) is QuadraticExpression for e in exprs)
-    has_linear_expression = any(type(e) is LinearExpression for e in exprs)
+    has_linear_expression = any(isinstance(e, LinearExpression) for e in exprs)
     if cls is None:
         cls = QuadraticExpression if has_quad_expression else LinearExpression
 
@@ -2111,7 +2701,8 @@ def merge(
 
     model = exprs[0].model
 
-    if cls in linopy_types and dim in HELPER_DIMS:
+    has_lazy = any(isinstance(e, LazyLinearExpression) and e.is_lazy for e in exprs)
+    if cls in linopy_types and dim in HELPER_DIMS and not has_lazy:
         coord_dims = [
             {k: v for k, v in e.sizes.items() if k not in HELPER_DIMS} for e in exprs
         ]
@@ -2119,15 +2710,24 @@ def merge(
     else:
         override = False
 
-    data = [e.data if isinstance(e, linopy_types) else e for e in exprs]
-    data = [fill_missing_coords(ds, fill_helper_dims=True) for ds in data]
+    data_list: list[Dataset] = [
+        e.data
+        if isinstance(e, linopy_types)
+        and not (isinstance(e, LazyLinearExpression) and e.is_lazy)
+        else e  # type: ignore[misc]
+        for e in exprs
+    ]
+    data_list = [
+        fill_missing_coords(d, fill_helper_dims=True) if isinstance(d, Dataset) else d
+        for d in data_list
+    ]
 
     if not kwargs:
         kwargs = {
             "coords": "minimal",
             "compat": "override",
         }
-        if cls == LinearExpression:
+        if issubclass(cls, LinearExpression):
             kwargs["fill_value"] = FILL_VALUE
         elif cls == variables.Variable:
             kwargs["fill_value"] = variables.FILL_VALUE
@@ -2138,20 +2738,70 @@ def merge(
             kwargs.setdefault("join", "outer")
 
     if dim == TERM_DIM:
-        ds = xr.concat([d[["coeffs", "vars"]] for d in data], dim, **kwargs)
+        # Use lazy merge for LinearExpression
+        if issubclass(cls, LinearExpression):
+            # Flatten any existing LazyLinearExpression parts
+            parts: list[Dataset] = []
+            const_arrays: list[DataArray] = []
+            for expr in exprs:
+                if isinstance(expr, LazyLinearExpression) and expr.is_lazy:
+                    parts.extend(expr._parts)
+                    c = (
+                        expr._const_override
+                        if expr._const_override is not None
+                        else xr.DataArray(0.0)
+                    )
+                    const_arrays.append(c)
+                else:
+                    d = expr.data if isinstance(expr, linopy_types) else expr
+                    d = fill_missing_coords(d, fill_helper_dims=True)
+                    const_arrays.append(d["const"])
+                    parts.append(d[["coeffs", "vars"]])
+
+            # Sum constants — skip zero-valued arrays to avoid creating
+            # a Cartesian product from disjoint dimensions.
+            def _is_all_zero(c: DataArray) -> bool:
+                vals = c.values
+                if isinstance(vals, np.ndarray):
+                    return bool((vals == 0).all())
+                return float(vals) == 0.0
+
+            nonzero_consts = [c for c in const_arrays if not _is_all_zero(c)]
+            if not nonzero_consts:
+                const: DataArray = xr.DataArray(0.0)
+            else:
+                const = nonzero_consts[0]
+                for c in nonzero_consts[1:]:
+                    const, c = xr.align(const, c, join="outer", fill_value=0)
+                    const = const + c
+
+            return LazyLinearExpression(  # type: ignore[return-value]
+                None,  # type: ignore[arg-type]
+                model,
+                parts=parts,
+                const=const,
+            )
+
+        ds = xr.concat([d[["coeffs", "vars"]] for d in data_list], dim, **kwargs)
         subkwargs = {**kwargs, "fill_value": 0}
-        const = xr.concat([d["const"] for d in data], dim, **subkwargs).sum(TERM_DIM)
+        const = xr.concat([d["const"] for d in data_list], dim, **subkwargs).sum(
+            TERM_DIM
+        )
         ds = assign_multiindex_safe(ds, const=const)
     elif dim == FACTOR_DIM:
-        ds = xr.concat([d[["vars"]] for d in data], dim, **kwargs)
-        coeffs = xr.concat([d["coeffs"] for d in data], dim, **kwargs).prod(FACTOR_DIM)
-        const = xr.concat([d["const"] for d in data], dim, **kwargs).prod(FACTOR_DIM)
+        ds = xr.concat([d[["vars"]] for d in data_list], dim, **kwargs)
+        coeffs = xr.concat([d["coeffs"] for d in data_list], dim, **kwargs).prod(
+            FACTOR_DIM
+        )
+        const = xr.concat([d["const"] for d in data_list], dim, **kwargs).prod(
+            FACTOR_DIM
+        )
         ds = assign_multiindex_safe(ds, coeffs=coeffs, const=const)
     else:
-        ds = xr.concat(data, dim, **kwargs)
+        ds = xr.concat(data_list, dim, **kwargs)
 
-    for d in set(HELPER_DIMS) & set(ds.coords):
-        ds = ds.reset_index(d, drop=True)
+    for dim_name in set(HELPER_DIMS) & set(ds.coords):
+        ds = ds.reset_index(dim_name, drop=True)
 
     return cls(ds, model)
 
