@@ -1485,3 +1485,48 @@ def test_deferred_many_disjoint_parts() -> None:
             matched = flat[flat["vars"] == var_id]
             assert len(matched) == 1
             assert matched.iloc[0]["coeffs"] == row["coeffs"]
+
+
+def test_deferred_flat_disjoint_uses_fast_path() -> None:
+    """Disjoint-dims .flat avoids materialization and gives correct results."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    y = m.add_variables(coords=[pd.Index([0, 1], name="j")], name="y")
+
+    deferred = 3 * x + 4 * y
+    assert isinstance(deferred, DeferredLinearExpression)
+    assert deferred._has_disjoint_dims()
+
+    # Fast-path flat should match per-part results
+    flat = deferred.flat
+    assert len(flat) == 4  # 2 x-vars + 2 y-vars
+    x_flat = (3 * x).flat
+    y_flat = (4 * y).flat
+    for _, row in x_flat.iterrows():
+        matched = flat[flat["vars"] == row["vars"]]
+        assert matched.iloc[0]["coeffs"] == row["coeffs"]
+    for _, row in y_flat.iterrows():
+        matched = flat[flat["vars"] == row["vars"]]
+        assert matched.iloc[0]["coeffs"] == row["coeffs"]
+
+
+def test_deferred_flat_overlapping_materializes_correctly() -> None:
+    """Overlapping-dims .flat materializes for correct broadcasting."""
+    m = Model()
+    x = m.add_variables(coords=[pd.Index([0, 1], name="i")], name="x")
+    z = m.add_variables(
+        coords=[pd.Index([0, 1], name="i"), pd.Index([0, 1, 2], name="j")], name="z"
+    )
+
+    deferred = 3 * x + 2 * z
+    assert isinstance(deferred, DeferredLinearExpression)
+    assert not deferred._has_disjoint_dims()
+
+    # Must materialize — x broadcasts across j, so each x-var gets coeff 3*3=9
+    materialized_flat = deferred.materialize().flat
+    deferred_flat = deferred.flat
+    # Both should be identical
+    merged = materialized_flat.merge(
+        deferred_flat, on="vars", suffixes=("_mat", "_def")
+    )
+    assert (merged["coeffs_mat"] == merged["coeffs_def"]).all()

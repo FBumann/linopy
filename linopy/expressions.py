@@ -2486,16 +2486,40 @@ class DeferredLinearExpression:
         return self.materialize().sum(dim=dim, **kwargs)
 
     # ------------------------------------------------------------------
-    # Outputs — always materialize for correctness
+    # Outputs — fast path for disjoint dims, materialize otherwise
     # ------------------------------------------------------------------
 
     @property
     def flat(self) -> pd.DataFrame:
-        """Materialize and return flat DataFrame."""
+        """
+        Return flat DataFrame.
+
+        When parts have disjoint dimensions, concatenates each part's flat
+        output directly (no cross-product). Otherwise materializes first
+        to ensure correct broadcasting.
+        """
+        if self._has_disjoint_dims():
+            dfs = [p.flat for p in self._parts]
+            df = pd.concat(dfs, ignore_index=True)
+            df = df.groupby("vars", as_index=False).sum()
+            check_has_nulls(df, name="DeferredLinearExpression")
+            return df
         return self.materialize().flat
 
     def to_polars(self, **kwargs: Any) -> pl.DataFrame:
-        """Materialize and return polars DataFrame."""
+        """
+        Return polars DataFrame.
+
+        When parts have disjoint dimensions, concatenates each part's polars
+        output directly (no cross-product). Otherwise materializes first
+        to ensure correct broadcasting.
+        """
+        if self._has_disjoint_dims():
+            dfs = [p.to_polars(**kwargs) for p in self._parts]
+            df = pl.concat(dfs)
+            df = group_terms_polars(df)
+            check_has_nulls_polars(df, name="DeferredLinearExpression")
+            return df
         return self.materialize().to_polars(**kwargs)
 
     # ------------------------------------------------------------------
