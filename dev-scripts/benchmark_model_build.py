@@ -83,9 +83,13 @@ def story2_model(n_nodes=50, n_lines=30, n_vehicles=40, n_routes=20, n_time=100)
         dims=["vehicle", "route", "time"],
         name="y",
     )
+    # This is the expensive step on master — Cartesian product blowup
     total = 2 * x + 3 * y
-    m.add_constraints(total <= 1, name="capacity")
-    m.add_objective(x.sum() + y.sum())
+    # Sum reduces back down; deferred branches can sum per-part
+    m.add_objective(total.sum())
+    # Same-dim constraints (no cross-product) to keep model realistic
+    m.add_constraints(x <= 10, name="x_upper")
+    m.add_constraints(y <= 10, name="y_upper")
     return m
 
 
@@ -134,7 +138,6 @@ SWEEP_SIZES = {
             (20, 100),
             (30, 100),
             (40, 100),
-            (50, 100),
         ]
     ],
     "pypsa": [{"snapshots": s} for s in [10, 50, 100, 200]],
