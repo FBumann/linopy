@@ -8,7 +8,6 @@ This module contains commonly used functions.
 from __future__ import annotations
 
 import operator
-import os
 from collections.abc import Callable, Generator, Hashable, Iterable, Sequence
 from functools import partial, reduce, wraps
 from pathlib import Path
@@ -18,7 +17,7 @@ from warnings import warn
 import numpy as np
 import pandas as pd
 import polars as pl
-from numpy import arange, signedinteger
+from numpy import signedinteger
 from xarray import DataArray, Dataset, apply_ufunc, broadcast
 from xarray import align as xr_align
 from xarray.core import dtypes, indexing
@@ -161,26 +160,6 @@ def pandas_to_dataarray(
         axis.name or get_from_iterable(dims, i) or f"dim_{i}"
         for i, axis in enumerate(arr.axes)
     ]
-    if coords is not None:
-        pandas_coords = dict(zip(dims, arr.axes))
-        if isinstance(coords, Sequence):
-            coords = dict(zip(dims, coords))
-        shared_dims = set(pandas_coords.keys()) & set(coords.keys())
-        non_aligned = []
-        for dim in shared_dims:
-            coord = coords[dim]
-            if not isinstance(coord, pd.Index):
-                coord = pd.Index(coord)
-            if not pandas_coords[dim].equals(coord):
-                non_aligned.append(dim)
-        if any(non_aligned):
-            warn(
-                f"coords for dimension(s) {non_aligned} is not aligned with the pandas object. "
-                "Previously, the indexes of the pandas were ignored and overwritten in "
-                "these cases. Now, the pandas object's coordinates are taken considered"
-                " for alignment."
-            )
-
     return DataArray(arr, coords=None, dims=dims, **kwargs)
 
 
@@ -213,18 +192,19 @@ def numpy_to_dataarray(
     if arr.ndim == 0:
         return DataArray(arr.item(), coords=coords, dims=dims, **kwargs)
 
-    ndim = max(arr.ndim, 0 if coords is None else len(coords))
     if isinstance(dims, Iterable | Sequence):
         dims = list(dims)
     elif dims is not None:
         dims = [dims]
 
     if dims is not None and len(dims):
-        # fill up dims with default names to match the number of dimensions
-        dims = [get_from_iterable(dims, i) or f"dim_{i}" for i in range(ndim)]
+        dims = [get_from_iterable(dims, i) or f"dim_{i}" for i in range(arr.ndim)]
 
-    if isinstance(coords, list) and dims is not None and len(dims):
-        coords = dict(zip(dims, coords))
+    if dims is not None and len(dims) and coords is not None:
+        if isinstance(coords, list):
+            coords = dict(zip(dims, coords[: arr.ndim]))
+        elif is_dict_like(coords):
+            coords = {k: v for k, v in coords.items() if k in dims}
 
     return DataArray(arr, coords=coords, dims=dims, **kwargs)
 
@@ -286,6 +266,32 @@ def as_dataarray(
     return arr
 
 
+def broadcast_mask(mask: DataArray, labels: DataArray) -> DataArray:
+    """
+    Broadcast a boolean mask to match the shape of labels.
+
+    Ensures that mask dimensions are a subset of labels dimensions, broadcasts
+    the mask accordingly, and fills any NaN values (from missing coordinates)
+    with False while emitting a FutureWarning.
+    """
+    assert set(mask.dims).issubset(labels.dims), (
+        "Dimensions of mask not a subset of resulting labels dimensions."
+    )
+    mask = mask.broadcast_like(labels)
+    if mask.isnull().any():
+        warn(
+            "Mask contains coordinates not covered by the data dimensions. "
+            "Missing values will be filled with False (masked out). "
+            "In a future version, this will raise an error. "
+            "Use mask.reindex() or `linopy.align()` to explicitly handle missing "
+            "coordinates.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        mask = mask.fillna(False).astype(bool)
+    return mask
+
+
 # TODO: rename to to_pandas_dataframe
 def to_dataframe(
     ds: Dataset,
@@ -333,11 +339,9 @@ def infer_schema_polars(ds: Dataset) -> dict[Hashable, pl.DataType]:
         dict: A dictionary mapping column names to their corresponding Polars data types.
     """
     schema = {}
-    np_major_version = int(np.__version__.split(".")[0])
-    use_int32 = os.name == "nt" and np_major_version < 2
     for name, array in ds.items():
         if np.issubdtype(array.dtype, np.integer):
-            schema[name] = pl.Int32 if use_int32 else pl.Int64
+            schema[name] = pl.Int32 if array.dtype.itemsize <= 4 else pl.Int64
         elif np.issubdtype(array.dtype, np.floating):
             schema[name] = pl.Float64  # type: ignore
         elif np.issubdtype(array.dtype, np.bool_):
@@ -449,6 +453,25 @@ def group_terms_polars(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def maybe_group_terms_polars(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Group terms only if there are duplicate (labels, vars) pairs.
+
+    This avoids the expensive group_by operation when terms already
+    reference distinct variables (e.g. ``x - y`` has ``_term=2`` but
+    no duplicates). When skipping, columns are reordered to match the
+    output of ``group_terms_polars``.
+    """
+    varcols = [c for c in df.columns if c.startswith("vars")]
+    keys = [c for c in ["labels"] + varcols if c in df.columns]
+    key_count = df.select(pl.struct(keys).n_unique()).item()
+    if key_count < df.height:
+        return group_terms_polars(df)
+    # Match column order of group_terms (group-by keys, coeffs, rest)
+    rest = [c for c in df.columns if c not in keys and c != "coeffs"]
+    return df.select(keys + ["coeffs"] + rest)
+
+
 def save_join(*dataarrays: DataArray, integer_dtype: bool = False) -> Dataset:
     """
     Join multiple xarray Dataarray's to a Dataset and warn if coordinates are not equal.
@@ -462,7 +485,7 @@ def save_join(*dataarrays: DataArray, integer_dtype: bool = False) -> Dataset:
         )
         arrs = xr_align(*dataarrays, join="outer")
         if integer_dtype:
-            arrs = tuple([ds.fillna(-1).astype(int) for ds in arrs])
+            arrs = tuple([ds.fillna(-1).astype(options["label_dtype"]) for ds in arrs])
     return Dataset({ds.name: ds for ds in arrs})
 
 
@@ -523,7 +546,7 @@ def fill_missing_coords(
     # Fill in missing integer coordinates
     for dim in ds.dims:
         if dim not in ds.coords and dim not in skip_dims:
-            ds.coords[dim] = arange(ds.sizes[dim])
+            ds.coords[dim] = np.arange(ds.sizes[dim])
 
     return ds
 
