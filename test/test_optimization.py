@@ -1172,3 +1172,37 @@ def test_auto_mask_constraint_model(
 
 #     m.add_objective((x + 2 * y).sum())
 #     m.solve()
+
+
+@pytest.mark.parametrize("solver,io_api,explicit_coordinate_names", params)
+def test_solver_log_captured(
+    model: Model, solver: str, io_api: str, explicit_coordinate_names: bool
+) -> None:
+    """Test that solver_log is populated after solving."""
+    model.solve(
+        solver, io_api=io_api, explicit_coordinate_names=explicit_coordinate_names
+    )
+    assert isinstance(model.solver_log, str)
+    assert len(model.solver_log) > 0
+
+
+@pytest.mark.parametrize("solver,io_api,explicit_coordinate_names", params)
+def test_solver_log_with_log_fn(
+    model: Model,
+    solver: str,
+    io_api: str,
+    explicit_coordinate_names: bool,
+    tmp_path: Any,
+) -> None:
+    """Test that solver_log is populated when log_fn is provided."""
+    log_fn = tmp_path / "solver.log"
+    model.solve(
+        solver,
+        io_api=io_api,
+        explicit_coordinate_names=explicit_coordinate_names,
+        log_fn=str(log_fn),
+    )
+    assert isinstance(model.solver_log, str)
+    assert len(model.solver_log) > 0
+    # The log file should also exist on disk since we provided it explicitly
+    assert log_fn.exists()

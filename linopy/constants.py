@@ -244,6 +244,7 @@ class Result:
     status: Status
     solution: Solution | None = None
     solver_model: Any = None
+    solver_log: str = ""
 
     def __repr__(self) -> str:
         solver_model_string = (
@@ -261,7 +262,8 @@ class Result:
             f"Termination condition: {self.status.termination_condition.value}\n"
             + solution_string
             + f"Solver model: {solver_model_string}\n"
-            f"Solver message: {self.status.legacy_status}"
+            f"Solver message: {self.status.legacy_status}\n"
+            f"Solver log: {len(self.solver_log)} characters"
         )
 
     def info(self) -> None:

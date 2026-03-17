@@ -112,6 +112,7 @@ class Model:
 
     solver_model: Any
     solver_name: str
+    solver_log: str
     _variables: Variables
     _constraints: Constraints
     _objective: Objective
@@ -156,6 +157,7 @@ class Model:
         "_solver_dir",
         "solver_model",
         "solver_name",
+        "solver_log",
         "matrices",
     )
 
@@ -1508,6 +1510,18 @@ class Model:
                     "Use a solver that supports them (gurobi, cplex, highs)."
                 )
 
+        # If no log file is specified, use a temporary file to capture solver log
+        temp_log_fn = None
+        if log_fn is None:
+            temp_log_file = NamedTemporaryFile(
+                suffix=".log", dir=self._solver_dir, delete=False
+            )
+            temp_log_fn = temp_log_file.name
+            temp_log_file.close()
+            effective_log_fn: str | Path | None = temp_log_fn
+        else:
+            effective_log_fn = log_fn
+
         try:
             solver_class = getattr(solvers, f"{solvers.SolverName(solver_name).name}")
             # initialize the solver as object of solver subclass <solver_class>
@@ -1519,7 +1533,7 @@ class Model:
                 result = solver.solve_problem_from_model(
                     model=self,
                     solution_fn=to_path(solution_fn),
-                    log_fn=to_path(log_fn),
+                    log_fn=to_path(effective_log_fn),
                     warmstart_fn=to_path(warmstart_fn),
                     basis_fn=to_path(basis_fn),
                     env=env,
@@ -1544,16 +1558,26 @@ class Model:
                 result = solver.solve_problem_from_file(
                     problem_fn=to_path(problem_fn),
                     solution_fn=to_path(solution_fn),
-                    log_fn=to_path(log_fn),
+                    log_fn=to_path(effective_log_fn),
                     warmstart_fn=to_path(warmstart_fn),
                     basis_fn=to_path(basis_fn),
                     env=env,
                 )
 
+            # Read solver log from the log file
+            log_file_to_read = effective_log_fn
+            if log_file_to_read is not None and os.path.exists(log_file_to_read):
+                with open(log_file_to_read) as f:
+                    result.solver_log = f.read()
+
         finally:
             for fn in (problem_fn, solution_fn):
                 if fn is not None and (os.path.exists(fn) and not keep_files):
                     os.remove(fn)
+            # Clean up temporary log file
+            if temp_log_fn is not None and os.path.exists(temp_log_fn):
+                if not keep_files:
+                    os.remove(temp_log_fn)
 
         try:
             result.info()
@@ -1562,6 +1586,7 @@ class Model:
             self.status = result.status.status.value
             self.termination_condition = result.status.termination_condition.value
             self.solver_model = result.solver_model
+            self.solver_log = result.solver_log
             self.solver_name = solver_name
 
             if not result.status.is_ok:
@@ -1625,6 +1650,7 @@ class Model:
         self.status = "ok"
         self.termination_condition = TerminationCondition.optimal.value
         self.solver_model = None
+        self.solver_log = ""
         self.solver_name = solver_name
 
         for name, var in self.variables.items():
