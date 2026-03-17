@@ -1456,6 +1456,8 @@ class Model:
 
         # If no log file is specified, use a temporary file to capture solver log
         temp_log_path: Path | None = None
+        effective_log_fn: str | Path | None = log_fn
+        solver_log = ""
         if log_fn is None:
             try:
                 temp_log_file = NamedTemporaryFile(
@@ -1463,13 +1465,11 @@ class Model:
                 )
                 temp_log_path = Path(temp_log_file.name)
                 temp_log_file.close()
+                effective_log_fn = temp_log_path
             except OSError:
                 logger.debug(
                     "Could not create temporary log file, skipping log capture"
                 )
-            effective_log_fn: str | Path | None = temp_log_path
-        else:
-            effective_log_fn = log_fn
 
         try:
             solver_class = getattr(solvers, f"{solvers.SolverName(solver_name).name}")
@@ -1515,7 +1515,6 @@ class Model:
 
         finally:
             # Read solver log from the log file before cleanup
-            solver_log = ""
             log_path = to_path(effective_log_fn)
             if log_path is not None and log_path.exists():
                 solver_log = log_path.read_text(encoding="utf-8", errors="replace")
