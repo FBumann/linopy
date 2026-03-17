@@ -6,6 +6,7 @@ This module contains frontend implementations of the package.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
@@ -1453,6 +1454,23 @@ class Model:
                     "Use reformulate_sos=True or 'auto', or a solver that supports SOS (gurobi, cplex)."
                 )
 
+        # If no log file is specified, use a temporary file to capture solver log
+        temp_log_path: Path | None = None
+        effective_log_fn: str | Path | None = log_fn
+        solver_log = ""
+        if log_fn is None:
+            try:
+                temp_log_file = NamedTemporaryFile(
+                    suffix=".log", dir=self._solver_dir, delete=False
+                )
+                temp_log_path = Path(temp_log_file.name)
+                temp_log_file.close()
+                effective_log_fn = temp_log_path
+            except OSError:
+                logger.debug(
+                    "Could not create temporary log file, skipping log capture"
+                )
+
         try:
             solver_class = getattr(solvers, f"{solvers.SolverName(solver_name).name}")
             # initialize the solver as object of solver subclass <solver_class>
@@ -1464,7 +1482,7 @@ class Model:
                 result = solver.solve_problem_from_model(
                     model=self,
                     solution_fn=to_path(solution_fn),
-                    log_fn=to_path(log_fn),
+                    log_fn=to_path(effective_log_fn),
                     warmstart_fn=to_path(warmstart_fn),
                     basis_fn=to_path(basis_fn),
                     env=env,
@@ -1489,16 +1507,28 @@ class Model:
                 result = solver.solve_problem_from_file(
                     problem_fn=to_path(problem_fn),
                     solution_fn=to_path(solution_fn),
-                    log_fn=to_path(log_fn),
+                    log_fn=to_path(effective_log_fn),
                     warmstart_fn=to_path(warmstart_fn),
                     basis_fn=to_path(basis_fn),
                     env=env,
                 )
 
         finally:
+            # Read solver log from the log file before cleanup
+            log_path = to_path(effective_log_fn)
+            if log_path is not None and log_path.exists():
+                solver_log = log_path.read_text(encoding="utf-8", errors="replace")
+
             for fn in (problem_fn, solution_fn):
                 if fn is not None and (os.path.exists(fn) and not keep_files):
                     os.remove(fn)
+            # Clean up temporary log file
+            if temp_log_path is not None and not keep_files:
+                temp_log_path.unlink(missing_ok=True)
+
+        # Attach solver log to metrics
+        if result.metrics is not None:
+            result.metrics = dataclasses.replace(result.metrics, solver_log=solver_log)
 
         try:
             result.info()
