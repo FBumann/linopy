@@ -262,6 +262,8 @@ class SolverMetrics:
     peak_memory : float or None
         Peak memory usage during solving (MB). Only populated for solvers
         that expose this information (e.g. Gurobi, Xpress).
+    solver_log : str or None
+        Full solver log output captured during solving.
     """
 
     solver_name: str | None = None
@@ -270,12 +272,17 @@ class SolverMetrics:
     dual_bound: float | None = None
     mip_gap: float | None = None
     peak_memory: float | None = None
+    solver_log: str | None = None
 
     def __repr__(self) -> str:
         fields = []
         for f in dataclasses.fields(self):
             val = getattr(self, f.name)
-            if val is not None:
+            if val is None:
+                continue
+            if f.name == "solver_log":
+                fields.append(f"solver_log='{len(val)} characters'")
+            else:
                 fields.append(f"{f.name}={val!r}")
         return f"SolverMetrics({', '.join(fields)})"
 
