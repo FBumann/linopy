@@ -393,6 +393,106 @@ class PiecewiseExpression:
         self.disjunctive = disjunctive
         self.active = active
 
+    @property
+    def _var_name(self) -> str:
+        """Get a display name for the expression variable."""
+        from linopy.variables import Variable
+
+        if isinstance(self.expr, Variable):
+            return self.expr.name
+        return "e"
+
+    @property
+    def _coord_sizes(self) -> dict:
+        """Return coordinate sizes from the wrapped expression."""
+        from linopy.expressions import LinearExpression
+        from linopy.variables import Variable
+
+        if isinstance(self.expr, Variable):
+            return dict(self.expr.sizes)
+        elif isinstance(self.expr, LinearExpression):
+            return dict(self.expr.coord_sizes)
+        return {}
+
+    def _compute_segment_params(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Compute (slopes, intercepts, x_lo, x_hi) from breakpoints.
+
+        Returns 1D arrays along the segment axis. For multi-dimensional
+        breakpoints (varying by coordinate), uses the first entry.
+        """
+        x = self.x_points.values
+        y = self.y_points.values
+
+        if self.disjunctive:
+            # shape (..., n_segments, 2) → flatten to first entry
+            while x.ndim > 2:
+                x, y = x[0], y[0]
+            dx = x[:, 1] - x[:, 0]
+            slopes = np.where(dx != 0, (y[:, 1] - y[:, 0]) / dx, np.inf)
+            intercepts = y[:, 0] - slopes * x[:, 0]
+            return slopes, intercepts, x[:, 0], x[:, 1]
+        else:
+            # shape (..., n_breakpoints) → flatten to first entry
+            while x.ndim > 1:
+                x, y = x[0], y[0]
+            dx = np.diff(x)
+            slopes = np.where(dx != 0, np.diff(y) / dx, np.inf)
+            intercepts = y[:-1] - slopes * x[:-1]
+            return slopes, intercepts, x[:-1], x[1:]
+
+    @property
+    def _n_segments(self) -> int:
+        if self.disjunctive:
+            return self.x_points.sizes.get(SEGMENT_DIM, 0)
+        return self.x_points.sizes.get(BREAKPOINT_DIM, 1) - 1
+
+    @property
+    def _breakpoints_vary(self) -> bool:
+        """True if breakpoints have coordinate dimensions (vary by entry)."""
+        internal = {BREAKPOINT_DIM, SEGMENT_DIM}
+        return bool(set(self.x_points.dims) - internal)
+
+    def __repr__(self) -> str:
+        formulation = "disjunctive" if self.disjunctive else "continuous"
+        n_seg = self._n_segments
+        var_name = self._var_name
+        coord_sizes = self._coord_sizes
+
+        seg_word = "segment" if n_seg == 1 else "segments"
+        header = f"PiecewiseExpression ({formulation}, {n_seg} {seg_word})"
+        if coord_sizes:
+            shape_str = ", ".join(f"{d}: {s}" for d, s in coord_sizes.items())
+            header += f" [{shape_str}]"
+
+        underscore = "-" * len(header)
+        lines: list[str] = [f"{header}\n{underscore}"]
+
+        # Segment equations
+        prefix = f"f({var_name}) = "
+        lines.extend(_format_braced_segments(self, prefix))
+
+        if self._breakpoints_vary:
+            lines.append("(breakpoints vary by coordinate)")
+
+        # "where e = ..." for LinearExpression
+        from linopy.expressions import LinearExpression
+
+        if isinstance(self.expr, LinearExpression):
+            lines.append("where e = LinearExpression")
+
+        if self.active is not None:
+            from linopy.variables import Variable
+
+            if isinstance(self.active, Variable):
+                lines.append(f"Active: Variable `{self.active.name}`")
+            else:
+                lines.append(f"Active: {type(self.active).__name__}")
+
+        return "\n".join(lines)
+
     # y <= pw  →  Python tries y.__le__(pw) → NotImplemented → pw.__ge__(y)
     def __ge__(self, other: LinExprLike) -> PiecewiseConstraintDescriptor:
         return PiecewiseConstraintDescriptor(lhs=other, sign="<=", piecewise_func=self)
@@ -411,6 +511,65 @@ class PiecewiseExpression:
         return PiecewiseConstraintDescriptor(lhs=other, sign="==", piecewise_func=self)
 
 
+SIGNS_PRETTY = {"<=": "≤", ">=": "≥", "==": "="}
+
+
+def _format_segment_expr(slope: float, intercept: float, var_name: str) -> str:
+    """Format a single segment as ``slope var_name + intercept``."""
+    slope_str = f"{slope:+.4g}"
+    if intercept == 0:
+        return f"{slope_str} {var_name}"
+    elif intercept > 0:
+        return f"{slope_str} {var_name} + {intercept:.4g}"
+    else:
+        return f"{slope_str} {var_name} - {abs(intercept):.4g}"
+
+
+def _format_braced_segments(pw: PiecewiseExpression, prefix: str) -> list[str]:
+    """
+    Format piecewise segments with ⎧⎨⎩ brace and a *prefix* on the middle line.
+
+    *prefix* is e.g. ``"f(x) = "`` or ``"fuel ≤ "``.
+    """
+    var_name = pw._var_name
+    slopes, intercepts, x_lo, x_hi = pw._compute_segment_params()
+    n = len(slopes)
+
+    if n == 0:
+        return [f"{prefix}<empty>"]
+
+    # Build (expr_str, domain_str) per segment
+    seg_strs: list[tuple[str, str]] = []
+    for i in range(n):
+        expr_str = _format_segment_expr(slopes[i], intercepts[i], var_name)
+        domain_str = f"if {x_lo[i]:.4g} ≤ {var_name} ≤ {x_hi[i]:.4g}"
+        seg_strs.append((expr_str, domain_str))
+
+    # Brace characters
+    if n == 1:
+        braces = [""]
+    elif n == 2:
+        braces = ["⎧", "⎩"]
+    else:
+        braces = ["⎧"] + ["⎨"] * (n - 2) + ["⎩"]
+
+    # Pad expressions so domain parts align
+    max_expr_len = max(len(s[0]) for s in seg_strs)
+
+    prefix_pad = " " * len(prefix)
+    mid = n // 2
+
+    lines: list[str] = []
+    for i, ((expr_str, domain_str), brace) in enumerate(zip(seg_strs, braces)):
+        padded_expr = expr_str.ljust(max_expr_len)
+        p = prefix if i == mid else prefix_pad
+        if brace:
+            lines.append(f"{p}{brace} {padded_expr}  {domain_str}")
+        else:
+            lines.append(f"{p}{padded_expr}  {domain_str}")
+    return lines
+
+
 @dataclass
 class PiecewiseConstraintDescriptor:
     """Holds all information needed to add a piecewise constraint to a model."""
@@ -418,6 +577,47 @@ class PiecewiseConstraintDescriptor:
     lhs: LinExprLike
     sign: str  # "<=", ">=", "=="
     piecewise_func: PiecewiseExpression
+
+    def _lhs_name(self) -> str:
+        """Get a display name for the lhs."""
+        from linopy.expressions import LinearExpression
+        from linopy.variables import Variable
+
+        if isinstance(self.lhs, Variable):
+            return self.lhs.name
+        if isinstance(self.lhs, LinearExpression) and self.lhs.nterm == 1:
+            # Single-variable expression: extract the variable name
+            label = int(self.lhs.vars.values.flat[0])
+            if label >= 0:
+                name, _ = self.lhs.model.variables.get_label_position(label)
+                return name
+        return "lhs"
+
+    def __repr__(self) -> str:
+        pw = self.piecewise_func
+        sign_pretty = SIGNS_PRETTY.get(self.sign, self.sign)
+        coord_sizes = pw._coord_sizes
+        lhs_name = self._lhs_name()
+
+        header = "PiecewiseConstraintDescriptor"
+        n_seg = pw._n_segments
+        formulation = "disjunctive" if pw.disjunctive else "continuous"
+        seg_word = "segment" if n_seg == 1 else "segments"
+        header += f" ({formulation}, {n_seg} {seg_word})"
+        if coord_sizes:
+            shape_str = ", ".join(f"{d}: {s}" for d, s in coord_sizes.items())
+            header += f" [{shape_str}]"
+
+        underscore = "-" * len(header)
+        lines: list[str] = [f"{header}\n{underscore}"]
+
+        prefix = f"{lhs_name} {sign_pretty} "
+        lines.extend(_format_braced_segments(pw, prefix))
+
+        if pw._breakpoints_vary:
+            lines.append("(breakpoints vary by coordinate)")
+
+        return "\n".join(lines)
 
 
 def _detect_disjunctive(x_points: DataArray, y_points: DataArray) -> bool:
