@@ -20,6 +20,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
+
 from benchmarks.snapshot import Metric, load_long_df
 
 if TYPE_CHECKING:
@@ -41,6 +43,22 @@ def _diverging_kwargs(midpoint: float = 0.0) -> dict:
         "color_continuous_scale": ["green", "white", "red"],
         "color_continuous_midpoint": midpoint,
     }
+
+
+def _symmetric_clip(magnitudes: np.ndarray, override: float | None, pct: float = 95.0) -> float:
+    """
+    Symmetric colour bound for a diverging scale: ``override`` if given, else the
+    ``pct`` percentile of ``|magnitudes|`` — so a few outliers don't wash the rest
+    to the midpoint. Positive; callers use ``[-b, +b]``.
+    """
+    if override is not None:
+        return float(override)
+    mags = np.abs(np.asarray(magnitudes, dtype=float))
+    mags = mags[np.isfinite(mags)]
+    if mags.size == 0:
+        return 1.0
+    bound = float(np.percentile(mags, pct))
+    return bound if bound > 0 else (float(mags.max()) or 1e-9)
 
 
 def _axis_kwargs(unit: str) -> dict:
@@ -104,6 +122,7 @@ def plot_compare(
     metric: Metric = "min",
     sort: SortMode = "absolute",
     facets: FacetBy | None = None,
+    clip: float | None = None,  # noqa: ARG001  (uniform signature, unused here)
 ) -> tuple[Figure, int]:
     """
     Bar chart of per-test delta, in alphabetical test-id order.
@@ -228,6 +247,7 @@ def plot_scatter(
     metric: Metric = "min",
     sort: SortMode = "absolute",  # noqa: ARG001  (uniform signature, unused here)
     facets: FacetBy | None = None,
+    clip: float | None = None,
 ) -> tuple[Figure, int]:
     """
     Baseline cost (log-x) vs candidate/baseline ratio (y) — the exploratory
@@ -239,7 +259,6 @@ def plot_scatter(
     ``animation_frame``. A dashed line at ``ratio = 1`` marks no change; colour
     encodes absolute Δ.
     """
-    import numpy as np
     import plotly.express as px
 
     if len(snapshots) < 2:
@@ -280,10 +299,7 @@ def plot_scatter(
 
     # Clip the colour scale to the p95 absolute Δ so one huge regression doesn't
     # wash the rest to white; outliers saturate at the bound.
-    clip = float(np.percentile(df["delta_abs"].abs(), 95)) if len(df) > 0 else 0.0
-    if clip == 0.0:
-        max_abs = float(df["delta_abs"].abs().max())
-        clip = max_abs if max_abs > 0 else 1e-9
+    color_clip = _symmetric_clip(df["delta_abs"].to_numpy(), clip)
 
     animate = len(snapshots) >= 3
     extra: dict = {}
@@ -300,7 +316,7 @@ def plot_scatter(
         y="ratio",
         color="delta_abs",
         **_diverging_kwargs(),
-        range_color=[-clip, clip],
+        range_color=[-color_clip, color_clip],
         log_x=True,
         range_x=[x_lo * 0.5, x_hi * 2],
         range_y=y_range,
@@ -344,8 +360,9 @@ def plot_sweep(
     metric: Metric = "min",
     sort: SortMode = "absolute",  # noqa: ARG001  (uniform signature, unused here)
     facets: FacetBy | None = None,  # noqa: ARG001  (uniform signature, unused here)
+    clip: float | None = None,
 ) -> tuple[Figure, int]:
-    """Heatmap of per-test ratio relative to the first snapshot."""
+    """Heatmap of per-test fold-change (log2 ratio) vs the first snapshot."""
     import plotly.express as px
 
     df_long, unit = load_long_df(snapshots, metric)
@@ -353,38 +370,54 @@ def plot_sweep(
     versions = df_long["snapshot"].drop_duplicates().tolist()
     baseline_label = versions[0]
 
-    # Pivot to absolutes, drop tests missing the baseline, divide by it for ratios.
     abs_df = df_long.pivot(index="test_id", columns="snapshot", values="value").reindex(
         columns=versions
     )
     abs_df = abs_df.dropna(subset=[baseline_label])
     if abs_df.empty:
         raise ValueError(f"no overlap with baseline snapshot {baseline_label}")
-    df = abs_df.div(abs_df[baseline_label], axis=0)
-    abs_df.index.name = "test"
-    df.index.name = "test"
+    ratio = abs_df.div(abs_df[baseline_label], axis=0)
+    # Colour by log2(ratio): plotly's colour scale is linear (no log mode), so raw
+    # ratio makes a 2x look twice as intense as its mirror 1/2x. log2 makes folds
+    # symmetric around 0; the bar is relabelled to fold-change. Range defaults to
+    # the symmetric p95 (override via --clip, a fold-change).
+    logr = np.log2(ratio.where(ratio > 0))
+    abs_df.index.name = ratio.index.name = logr.index.name = "test"
 
+    bound = _symmetric_clip(logr.values, float(np.log2(clip)) if clip else None)
     fig = px.imshow(
-        df,
-        **_diverging_kwargs(1.0),
+        logr,
+        color_continuous_scale=["green", "white", "red"],
+        color_continuous_midpoint=0.0,
+        zmin=-bound,
+        zmax=bound,
         aspect="auto",
-        title=f"{metric_label} ratio relative to baseline ({versions[0]})",
-        labels={"x": "version", "y": "test", "color": "ratio"},
-        text_auto=".2f",
+        title=f"{metric_label} fold-change vs baseline ({versions[0]})",
+        labels={"x": "version", "y": "test", "color": "fold"},
     )
-    # Absolute values as customdata so hover shows both ratio and value.
+    # Fold-change ticks at integer log2 steps spanning the actual colour range.
+    hi = max(1, int(bound))
+    ticks = list(range(-hi, hi + 1))
+    fig.update_coloraxes(
+        colorbar=dict(
+            tickvals=ticks,
+            ticktext=[f"{2**t}×" if t >= 0 else f"1/{2**-t}×" for t in ticks],
+            title="fold",
+        )
+    )
     fig.update_traces(
+        text=ratio.round(2).values,
+        texttemplate="%{text}×",
         customdata=abs_df.values,
         hovertemplate=(
-            "test: %{y}<br>"
-            "version: %{x}<br>"
-            "ratio: %{z:.3f}<br>"
+            "test: %{y}<br>version: %{x}<br>"
+            "fold: %{text}×<br>"
             f"{metric_label}: %{{customdata:.4g}}{unit}"
             "<extra></extra>"
         ),
     )
-    fig.update_layout(height=max(500, len(df) * 22))
-    return fig, len(df)
+    fig.update_layout(height=max(500, len(logr) * 22))
+    return fig, len(logr)
 
 
 # Per sweep axis: (x label, log-scaled?). Size is multiplicative → log; severity
@@ -400,6 +433,7 @@ def plot_scaling(
     metric: Metric = "min",
     sort: SortMode = "absolute",  # noqa: ARG001  (uniform signature, unused here)
     facets: FacetBy | None = None,  # noqa: ARG001  (uniform signature, unused here)
+    clip: float | None = None,  # noqa: ARG001  (uniform signature, unused here)
 ) -> tuple[Figure, int]:
     """
     Cost vs the sweep dial for parametrized tests, faceted by phase.
@@ -448,7 +482,10 @@ def plot_scaling(
 
 RENDERERS: dict[
     PlotView,
-    Callable[[list[Path], Metric, SortMode, FacetBy | None], tuple[Figure, int]],
+    Callable[
+        [list[Path], Metric, SortMode, FacetBy | None, float | None],
+        tuple[Figure, int],
+    ],
 ] = {
     "compare": plot_compare,
     "scatter": plot_scatter,

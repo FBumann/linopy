@@ -61,6 +61,17 @@ def plot(
             ),
         ),
     ] = None,
+    clip: Annotated[
+        float | None,
+        typer.Option(
+            "--clip",
+            help=(
+                "Override the symmetric p95 colour clamp. Sweep: a "
+                "fold-change (>1) — ``--clip 8`` shows ⅛×–8×, beyond saturates. "
+                "Scatter: an absolute Δ bound. compare/scaling ignore it."
+            ),
+        ),
+    ] = None,
     output: Annotated[
         Path | None,
         typer.Option(
@@ -129,6 +140,17 @@ def plot(
             "scaling view takes exactly 1 snapshot", fg=typer.colors.RED, err=True
         )
         raise typer.Exit(code=2)
+    if clip is not None:
+        if clip <= 0:
+            typer.secho("--clip must be positive", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2)
+        if chosen == "sweep" and clip <= 1:
+            typer.secho(
+                "sweep --clip is a fold-change > 1 (e.g. 8 for ⅛×–8×)",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2)
 
     # RENDERERS imports fine without plotly (lazy inside each), so check the dep.
     if importlib.util.find_spec("plotly") is None:
@@ -147,7 +169,7 @@ def plot(
         output = Path(".benchmarks") / "plots" / f"{chosen}.html"
 
     try:
-        fig, n_tests = RENDERERS[chosen](snapshots, metric, sort, facets)
+        fig, n_tests = RENDERERS[chosen](snapshots, metric, sort, facets, clip)
     except ValueError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
