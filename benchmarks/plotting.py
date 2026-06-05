@@ -125,7 +125,8 @@ def plot_compare(
     clip: float | None = None,
 ) -> tuple[Figure, int]:
     """
-    Bar chart of per-test delta, in alphabetical test-id order.
+    Bar chart of per-test delta, sorted by the chosen ``--sort`` Δ
+    (biggest regressions on top, improvements at the bottom).
 
     ``sort`` picks the bar dimension: ``absolute`` (default) plots ``b - a`` in
     the native unit, ``relative`` plots percent change. Bars stay in id order
@@ -166,8 +167,8 @@ def plot_compare(
 
     df["delta_abs"] = df[b_label] - df[a_label]
     df["delta_pct"] = (df["delta_abs"] / df[a_label]) * 100.0
-    df = df.sort_values("test_id").reset_index(drop=True)
     x_col = "delta_abs" if sort == "absolute" else "delta_pct"
+    df = df.sort_values(x_col).reset_index(drop=True)
 
     if sort == "absolute":
         x_label = f"{metric_label} delta ({unit})"

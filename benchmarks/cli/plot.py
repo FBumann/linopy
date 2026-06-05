@@ -4,12 +4,27 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 
 from benchmarks.cli._base import _suggest_snapshots, app
 from benchmarks.plotting import FacetBy, Metric, PlotView, SortMode
+
+
+def _snapshot_version_key(p: Path) -> tuple[int, object]:
+    """Sort key parsing ``linopy-<ver>`` from a filename; non-matches sort last."""
+    import re
+
+    from packaging.version import InvalidVersion, Version
+
+    m = re.search(r"-(\d[\w.]*)\.json$", p.name)
+    if m:
+        try:
+            return (0, Version(m.group(1)))
+        except InvalidVersion:
+            pass
+    return (1, p.name)
 
 
 @app.command()
@@ -28,6 +43,18 @@ def plot(
             )
         ),
     ] = None,
+    order: Annotated[
+        Literal["input", "version"],
+        typer.Option(
+            "--order",
+            help=(
+                "Snapshot input order. ``input`` (default) keeps the order you "
+                "pass — the plot never re-sorts. ``version`` sorts inputs by the "
+                "parsed ``linopy-<ver>``, fixing a glob's string order (0.3.10 "
+                "before 0.3.2) for release-history sweeps."
+            ),
+        ),
+    ] = "input",
     metric: Annotated[
         Metric,
         typer.Option(
@@ -42,10 +69,10 @@ def plot(
         SortMode,
         typer.Option(
             help=(
-                "Compare-view sort and bar dimension. ``absolute`` (default) "
-                "uses ``b - a`` in seconds so the biggest actual-time impacts "
-                "float to the bottom — avoids over-weighting cheap "
-                "microsecond tests. ``relative`` uses percent change."
+                "Compare-view bar metric *and* sort. ``absolute`` (default) "
+                "ranks by ``b - a`` (actual-time/MiB impact, not over-weighting "
+                "tiny tests); ``relative`` by percent change. Bars are ordered by "
+                "it — biggest regressions on top, improvements at the bottom."
             )
         ),
     ] = "absolute",
@@ -117,6 +144,9 @@ def plot(
     if missing:
         _suggest_snapshots(f"missing snapshots: {[str(p) for p in missing]}")
         raise typer.Exit(code=2)
+
+    if order == "version":
+        snapshots = sorted(snapshots, key=_snapshot_version_key)
 
     chosen = view or (
         "scaling"
