@@ -122,7 +122,7 @@ def plot_compare(
     metric: Metric = "min",
     sort: SortMode = "absolute",
     facets: FacetBy | None = None,
-    clip: float | None = None,  # noqa: ARG001  (uniform signature, unused here)
+    clip: float | None = None,
 ) -> tuple[Figure, int]:
     """
     Bar chart of per-test delta, in alphabetical test-id order.
@@ -202,7 +202,7 @@ def plot_compare(
         facet_kwargs = {"facet_col": facets}
         facet_kwargs["facet_col_wrap"] = 2 if facets == "phase" else 3
 
-    color_clip = _symmetric_clip(df[x_col].to_numpy(), None)
+    color_clip = _symmetric_clip(df[x_col].to_numpy(), clip)
     fig = px.bar(
         df,
         x=x_col,
@@ -293,18 +293,16 @@ def plot_scatter(
     df = df[df["ratio"] > 0].rename(columns={"test_id": "test"})
     # Fixed ranges so the animation doesn't jitter; pad to avoid edge clipping.
     x_lo, x_hi = df["baseline_time"].min(), df["baseline_time"].max()
-    # ratio is multiplicative → log y-axis; window symmetric about 1.0 in log
-    # space, defaulting to the symmetric p95 fold (override via --clip, a
-    # fold-change). plotly log-converts range_y itself, so give it ratio units.
-    log_bound = _symmetric_clip(
-        np.log2(df["ratio"].to_numpy()), np.log2(clip) if clip else None
-    )
-    bound = max(float(2.0 ** (log_bound * 1.08)), 1.1)
+    # ratio is multiplicative → log y-axis; show the *full* fold range (symmetric
+    # about 1.0) so every point is visible — zoom interactively to focus.
+    y_lo, y_hi = df["ratio"].min(), df["ratio"].max()
+    fold = max(y_hi, 1.0 / y_lo, 1.1)
+    bound = fold**1.05
     y_range = [1.0 / bound, bound]
 
-    # Colour auto-clamps to the symmetric p95 absolute Δ (not --clip-tunable —
-    # that flag is folds, which here drive the y-axis above).
-    color_clip = _symmetric_clip(df["delta_abs"].to_numpy(), None)
+    # --clip clamps the *colour* — the one thing you can't zoom after the plot is
+    # made. Here colour is the absolute Δ, so it's a linear bound. Default: p95.
+    color_clip = _symmetric_clip(df["delta_abs"].to_numpy(), clip)
 
     animate = len(snapshots) >= 3
     extra: dict = {}
