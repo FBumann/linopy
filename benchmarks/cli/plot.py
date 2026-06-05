@@ -66,9 +66,10 @@ def plot(
         typer.Option(
             "--clip",
             help=(
-                "Override the symmetric p95 colour clamp. Sweep: a "
-                "fold-change (>1) — ``--clip 8`` shows ⅛×–8×, beyond saturates. "
-                "Scatter: an absolute Δ bound. compare/scaling ignore it."
+                "Bound the ratio axis to a fold-change (>1); default is the "
+                "symmetric p95. Sweep clamps the colour (±log₂) — ``--clip 8`` "
+                "shows ⅛×–8×; scatter clamps the y-axis to ``[1/clip, clip]``. "
+                "compare/scaling have no ratio axis and ignore it."
             ),
         ),
     ] = None,
@@ -140,17 +141,13 @@ def plot(
             "scaling view takes exactly 1 snapshot", fg=typer.colors.RED, err=True
         )
         raise typer.Exit(code=2)
-    if clip is not None:
-        if clip <= 0:
-            typer.secho("--clip must be positive", fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=2)
-        if chosen == "sweep" and clip <= 1:
-            typer.secho(
-                "sweep --clip is a fold-change > 1 (e.g. 8 for ⅛×–8×)",
-                fg=typer.colors.RED,
-                err=True,
-            )
-            raise typer.Exit(code=2)
+    if clip is not None and clip <= 1:
+        typer.secho(
+            "--clip is a fold-change > 1 (e.g. 8 for ⅛×–8×)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
     # RENDERERS imports fine without plotly (lazy inside each), so check the dep.
     if importlib.util.find_spec("plotly") is None:

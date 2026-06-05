@@ -293,16 +293,18 @@ def plot_scatter(
     df = df[df["ratio"] > 0].rename(columns={"test_id": "test"})
     # Fixed ranges so the animation doesn't jitter; pad to avoid edge clipping.
     x_lo, x_hi = df["baseline_time"].min(), df["baseline_time"].max()
-    # ratio is multiplicative → log y-axis (set below) so 2x and 1/2x read
-    # symmetrically about 1.0; window symmetric in log10 space, larger fold wins.
-    y_lo, y_hi = df["ratio"].min(), df["ratio"].max()
-    fold = max(y_hi, 1.0 / y_lo, 1.1)
-    bound = fold**1.08  # ~8% pad in log space; plotly log-converts range_y itself
+    # ratio is multiplicative → log y-axis; window symmetric about 1.0 in log
+    # space, defaulting to the symmetric p95 fold (override via --clip, a
+    # fold-change). plotly log-converts range_y itself, so give it ratio units.
+    log_bound = _symmetric_clip(
+        np.log2(df["ratio"].to_numpy()), np.log2(clip) if clip else None
+    )
+    bound = max(float(2.0 ** (log_bound * 1.08)), 1.1)
     y_range = [1.0 / bound, bound]
 
-    # Clip the colour scale to the p95 absolute Δ so one huge regression doesn't
-    # wash the rest to white; outliers saturate at the bound.
-    color_clip = _symmetric_clip(df["delta_abs"].to_numpy(), clip)
+    # Colour auto-clamps to the symmetric p95 absolute Δ (not --clip-tunable —
+    # that flag is folds, which here drive the y-axis above).
+    color_clip = _symmetric_clip(df["delta_abs"].to_numpy(), None)
 
     animate = len(snapshots) >= 3
     extra: dict = {}
