@@ -7,15 +7,27 @@ import pytest
 from benchmarks.registry import BenchSpec
 
 # Test modules the CodSpeed instruments measure (edit to change coverage).
-# Covers construction, both solver-IO paths (lp_write = file, solver_handoff =
-# direct in-memory), and the matrix build. test_netcdf is excluded — disk I/O is
-# slow and noisy under walltime; it still runs under ``benchmarks smoke``.
+# build + the two export paths: to_lp (LP text) and to_solver (direct handoff,
+# which also exercises matrix-gen). matrices is dropped — a subset of to_solver;
+# netcdf excluded — disk I/O, noisy. All still run under ``benchmarks smoke``.
 CODSPEED_MODULES = (
     "test_build",
-    "test_matrices",
-    "test_lp_write",
-    "test_solver_handoff",
+    "test_to_lp",
+    "test_to_solver",
 )
+
+# Cachegrind (simulation) is ~hundreds× native and under-weights sparse/native
+# work, so the simulation job trims to the cheap phases; to_solver is carried
+# per-PR by the memory instrument and on master by walltime instead.
+CODSPEED_SIMULATION_MODULES = ("test_build", "test_to_lp")
+
+# Only the cachegrind (simulation) job trims; memory/walltime use the full set
+# (the default). Chosen via our own ``--codspeed-set`` option — no
+# pytest-codspeed internals, no silent mode-sniffing.
+CODSPEED_SETS = {
+    "full": CODSPEED_MODULES,
+    "simulation": CODSPEED_SIMULATION_MODULES,
+}
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -24,6 +36,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Use smaller problem sizes for quick benchmarking (CI smoke).",
+    )
+    parser.addoption(
+        "--codspeed-set",
+        choices=sorted(CODSPEED_SETS),
+        default="full",
+        help=(
+            "Which CodSpeed module subset to run (default 'full'; 'simulation' "
+            "trims the expensive cachegrind phases). Only takes effect under "
+            "--codspeed."
+        ),
     )
     parser.addoption(
         "--long",
@@ -41,7 +63,7 @@ def pytest_collection_modifyitems(
 ) -> None:
     """
     ``--quick`` drops the PyPSA end-to-end test (~30s; minutes under cachegrind).
-    ``--codspeed`` narrows the run to ``CODSPEED_MODULES``.
+    ``--codspeed`` narrows the run to the ``--codspeed-set`` instrument subset.
     """
     if config.getoption("--quick"):
         skip = pytest.mark.skip(reason="--quick: pypsa end-to-end skipped")
@@ -50,10 +72,11 @@ def pytest_collection_modifyitems(
                 item.add_marker(skip)
 
     if getattr(config.option, "codspeed", False):
-        deselected = [i for i in items if i.path.stem not in CODSPEED_MODULES]
+        modules = CODSPEED_SETS[config.getoption("--codspeed-set")]
+        deselected = [i for i in items if i.path.stem not in modules]
         if deselected:
             config.hook.pytest_deselected(items=deselected)
-            items[:] = [i for i in items if i.path.stem in CODSPEED_MODULES]
+            items[:] = [i for i in items if i.path.stem in modules]
 
 
 def maybe_skip(request: pytest.FixtureRequest, spec: BenchSpec, size: int) -> None:
