@@ -13,6 +13,10 @@ on:
     branches: [ master ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write  # OIDC auth for the CodSpeed action
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -21,8 +25,6 @@ jobs:
   codspeed:
     name: CodSpeed (micro regression detection)
     runs-on: ubuntu-latest
-    # Red until CODSPEED_TOKEN is set on the org — don't fail master on it.
-    continue-on-error: true
     steps:
     - uses: actions/checkout@v6
       with:
@@ -40,8 +42,8 @@ jobs:
         uv pip install --system -e ".[dev,benchmarks]"
 
     - name: Run benchmarks under CodSpeed
-      uses: CodSpeedHQ/action@v3
+      uses: CodSpeedHQ/action@v4
       with:
-        token: ${{ secrets.CODSPEED_TOKEN }}
+        mode: simulation
         run: |
           pytest benchmarks/ --quick --codspeed

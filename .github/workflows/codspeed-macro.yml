@@ -9,12 +9,16 @@ name: CodSpeed (walltime macro)
 # (600/month free), unlike the instrumentation workflow.
 #
 # Requires the repo under a GitHub org (macro runners are org-only) with the
-# CodSpeed app installed and CODSPEED_TOKEN set.
+# CodSpeed app installed.
 
 on:
   push:
     branches: [ master ]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write  # OIDC auth for the CodSpeed action
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -24,11 +28,6 @@ jobs:
   macro:
     name: CodSpeed walltime (macro runner)
     runs-on: codspeed-macro
-    # Red until CODSPEED_TOKEN is set on the org — don't fail master on it.
-    continue-on-error: true
-    permissions:
-      contents: read
-      id-token: write
     steps:
     - uses: actions/checkout@v6
       with:
@@ -46,9 +45,8 @@ jobs:
         uv pip install --system -e ".[dev,benchmarks]"
 
     - name: Run benchmarks under CodSpeed (walltime)
-      uses: CodSpeedHQ/action@v3
+      uses: CodSpeedHQ/action@v4
       with:
         mode: walltime
-        token: ${{ secrets.CODSPEED_TOKEN }}
         run: |
           pytest benchmarks/ --quick --codspeed
