@@ -55,6 +55,17 @@ def plot(
             ),
         ),
     ] = "input",
+    reverse: Annotated[
+        bool,
+        typer.Option(
+            "--reverse/--no-reverse",
+            help=(
+                "Reverse the snapshot order (after --order). E.g. ``--order "
+                "version --reverse`` = newest-first; in compare/scatter it flips "
+                "which snapshot is the baseline."
+            ),
+        ),
+    ] = False,
     metric: Annotated[
         Metric,
         typer.Option(
@@ -147,6 +158,8 @@ def plot(
 
     if order == "version":
         snapshots = sorted(snapshots, key=_snapshot_version_key)
+    if reverse:
+        snapshots = snapshots[::-1]
 
     chosen = view or (
         "scaling"
