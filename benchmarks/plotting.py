@@ -202,6 +202,7 @@ def plot_compare(
         facet_kwargs = {"facet_col": facets}
         facet_kwargs["facet_col_wrap"] = 2 if facets == "phase" else 3
 
+    color_clip = _symmetric_clip(df[x_col].to_numpy(), None)
     fig = px.bar(
         df,
         x=x_col,
@@ -209,6 +210,7 @@ def plot_compare(
         orientation="h",
         color=x_col,
         **_diverging_kwargs(),
+        range_color=[-color_clip, color_clip],
         title=title,
         labels={x_col: x_label, y_col: ""},
         text_auto=text_fmt,
@@ -287,15 +289,16 @@ def plot_scatter(
     df["ratio"] = df["candidate_time"] / df["baseline_time"]
     df["delta_abs"] = df["candidate_time"] - df["baseline_time"]
     df["delta_pct"] = df["delta_abs"] / df["baseline_time"] * 100.0
-    df = df.rename(columns={"test_id": "test"})
+    # log y-axis can't show a zero ratio (candidate value of 0) — drop those.
+    df = df[df["ratio"] > 0].rename(columns={"test_id": "test"})
     # Fixed ranges so the animation doesn't jitter; pad to avoid edge clipping.
     x_lo, x_hi = df["baseline_time"].min(), df["baseline_time"].max()
-    # y-range centred symmetrically on 1.0 so regressions and improvements read
-    # equally; the larger side sets the window width.
+    # ratio is multiplicative → log y-axis (set below) so 2x and 1/2x read
+    # symmetrically about 1.0; window symmetric in log10 space, larger fold wins.
     y_lo, y_hi = df["ratio"].min(), df["ratio"].max()
-    max_dist = max(abs(1.0 - y_lo), abs(y_hi - 1.0), 0.05)
-    pad_y = max(0.05, max_dist * 0.05)
-    y_range = [1.0 - max_dist - pad_y, 1.0 + max_dist + pad_y]
+    fold = max(y_hi, 1.0 / y_lo, 1.1)
+    bound = fold**1.08  # ~8% pad in log space; plotly log-converts range_y itself
+    y_range = [1.0 / bound, bound]
 
     # Clip the colour scale to the p95 absolute Δ so one huge regression doesn't
     # wash the rest to white; outliers saturate at the bound.
@@ -318,6 +321,7 @@ def plot_scatter(
         **_diverging_kwargs(),
         range_color=[-color_clip, color_clip],
         log_x=True,
+        log_y=True,
         range_x=[x_lo * 0.5, x_hi * 2],
         range_y=y_range,
         hover_name="test",
@@ -335,7 +339,7 @@ def plot_scatter(
         ),
         labels={
             "baseline_time": f"baseline {metric_label} ({unit}, log scale)",
-            "ratio": f"{metric_label} ratio  (candidate / baseline)",
+            "ratio": f"{metric_label} ratio (candidate / baseline, log scale)",
             "candidate_time": "candidate",
             "delta_abs": f"Δ ({unit}, p95-clipped)",
         },
