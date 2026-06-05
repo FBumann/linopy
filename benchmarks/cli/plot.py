@@ -4,27 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
 import typer
 
 from benchmarks.cli._base import _suggest_snapshots, app
 from benchmarks.plotting import FacetBy, Metric, PlotView, SortMode
-
-
-def _snapshot_version_key(p: Path) -> tuple[int, object]:
-    """Sort key parsing ``linopy-<ver>`` from a filename; non-matches sort last."""
-    import re
-
-    from packaging.version import InvalidVersion, Version
-
-    m = re.search(r"-(\d[\w.]*)\.json$", p.name)
-    if m:
-        try:
-            return (0, Version(m.group(1)))
-        except InvalidVersion:
-            pass
-    return (1, p.name)
 
 
 @app.command()
@@ -43,29 +28,6 @@ def plot(
             )
         ),
     ] = None,
-    order: Annotated[
-        Literal["input", "version"],
-        typer.Option(
-            "--order",
-            help=(
-                "Snapshot input order. ``input`` (default) keeps the order you "
-                "pass — the plot never re-sorts. ``version`` sorts inputs by the "
-                "parsed ``linopy-<ver>``, fixing a glob's string order (0.3.10 "
-                "before 0.3.2) for release-history sweeps."
-            ),
-        ),
-    ] = "input",
-    reverse: Annotated[
-        bool,
-        typer.Option(
-            "--reverse/--no-reverse",
-            help=(
-                "Reverse the snapshot order (after --order). E.g. ``--order "
-                "version --reverse`` = newest-first; in compare/scatter it flips "
-                "which snapshot is the baseline."
-            ),
-        ),
-    ] = False,
     metric: Annotated[
         Metric,
         typer.Option(
@@ -155,11 +117,6 @@ def plot(
     if missing:
         _suggest_snapshots(f"missing snapshots: {[str(p) for p in missing]}")
         raise typer.Exit(code=2)
-
-    if order == "version":
-        snapshots = sorted(snapshots, key=_snapshot_version_key)
-    if reverse:
-        snapshots = snapshots[::-1]
 
     chosen = view or (
         "scaling"
