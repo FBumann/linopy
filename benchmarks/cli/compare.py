@@ -63,12 +63,18 @@ def compare(ctx: typer.Context) -> None:
         _suggest_snapshots(f"missing snapshots: {[str(p) for p in missing]}")
         raise typer.Exit(code=2)
 
-    # Auto-detect the metric from the snapshots (memory snapshots carry a
-    # ``peak_mib`` key; timing ones don't) and route accordingly — no
-    # ``memory compare`` needed.
-    import json
+    # Auto-detect the metric from the snapshots (memory snapshots load as MiB,
+    # timing as s) and route accordingly — no ``memory compare`` needed.
+    # ``load_snapshot`` validates each file, so a malformed/unreadable one
+    # fails here with a clear, file-named message instead of a raw traceback.
+    from benchmarks.snapshot import load_snapshot
 
-    is_memory = ["peak_mib" in json.loads(p.read_text()) for p in snapshots]
+    try:
+        units = [load_snapshot(p)[2] for p in snapshots]
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+    is_memory = [u == "MiB" for u in units]
     if any(is_memory):
         if not all(is_memory):
             typer.secho(
