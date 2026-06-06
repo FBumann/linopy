@@ -33,6 +33,28 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Default runs skip them."
         ),
     )
+    parser.addoption(
+        "--size",
+        action="append",
+        type=int,
+        default=[],
+        metavar="N",
+        help=(
+            "Run only these model sizes (repeatable). Overrides --quick/--long "
+            "for models, leaving patterns on the prevailing tier."
+        ),
+    )
+    parser.addoption(
+        "--severity",
+        action="append",
+        type=int,
+        default=[],
+        metavar="S",
+        help=(
+            "Run only these pattern severities (repeatable). Overrides "
+            "--quick/--long for patterns, leaving models on the prevailing tier."
+        ),
+    )
 
 
 def pytest_collection_modifyitems(
@@ -57,25 +79,36 @@ def pytest_collection_modifyitems(
 
 def maybe_skip(request: pytest.FixtureRequest, spec: BenchSpec, size: int) -> None:
     """
-    Apply size-tier skips and ``spec.requires`` importorskips.
+    Apply size selection and ``spec.requires`` importorskips.
 
-    Tiers (most restrictive first):
+    Selection (most specific first):
 
-    - ``--quick``                 → skip ``size > quick_threshold``
-    - default (no flag)           → skip ``size > long_threshold``
-    - ``--long``                  → no size cap
+    - ``--size N`` / ``--severity S`` → run only the listed values for that
+      axis (models read ``--size``, patterns ``--severity``); overrides tiers.
+    - ``--quick``                     → only ``spec.quick_subset``
+    - default (no flag)               → skip ``size > long_threshold``
+    - ``--long``                      → no size cap
 
-    If both ``--quick`` and ``--long`` are passed, ``--quick`` wins (the more
-    restrictive mode is honoured).
+    A manual axis flag wins over ``--quick``/``--long``; ``--quick`` in turn
+    wins over ``--long`` (the more restrictive mode is honoured).
     """
     for mod in spec.requires:
         pytest.importorskip(mod)
+
+    # Manual axis selection (e.g. from CI): --size for models, --severity for
+    # patterns. Empty list ⇒ not requested, fall through to the tier flags.
+    flag = "--severity" if spec.axis == "severity" else "--size"
+    manual = request.config.getoption(flag)
+    if manual:
+        if size not in manual:
+            pytest.skip(f"{flag}: {spec.name} {spec.axis}={size} not selected")
+        return
 
     quick = request.config.getoption("--quick")
     long_ = request.config.getoption("--long")
 
     if quick:
-        if size > spec.quick_threshold:
+        if size not in spec.quick_subset:
             pytest.skip(f"--quick: skipping {spec.name} {spec.axis}={size}")
     elif not long_:
         if size > spec.long_threshold:

@@ -281,7 +281,7 @@ def run_phase(
                 break
         else:
             for value in spec.sweep:
-                if quick and value > spec.quick_threshold:
+                if quick and value not in spec.quick_subset:
                     continue
                 key = spec_param_id(spec.name, spec.axis, value)
                 if filter_expr and filter_expr not in key:
