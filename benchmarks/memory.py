@@ -385,16 +385,21 @@ def save(
 
 
 def compare(label_a: str, label_b: str) -> None:
-    """Diff two saved memory snapshots side-by-side."""
+    """Diff two saved memory snapshots (by label) side-by-side."""
     path_a = RESULTS_DIR / f"{label_a}.json"
     path_b = RESULTS_DIR / f"{label_b}.json"
     for p in (path_a, path_b):
         if not p.exists():
             print(f"Not found: {p}. Run 'save {p.stem}' first.", file=sys.stderr)
             sys.exit(1)
+    compare_snapshots(path_a, path_b)
 
-    data_a = json.loads(path_a.read_text())["peak_mib"]
-    data_b = json.loads(path_b.read_text())["peak_mib"]
+
+def compare_snapshots(path_a: Path, path_b: Path) -> None:
+    """Diff two memory snapshots (by path) side-by-side."""
+    label_a, label_b = Path(path_a).stem, Path(path_b).stem
+    data_a = json.loads(Path(path_a).read_text())["peak_mib"]
+    data_b = json.loads(Path(path_b).read_text())["peak_mib"]
 
     all_tests = sorted(set(data_a) | set(data_b))
 

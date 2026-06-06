@@ -29,8 +29,9 @@ def compare(ctx: typer.Context) -> None:
     With no arguments (or missing paths), prints what snapshots exist
     under ``.benchmarks/`` so you can copy-paste the path you want.
 
-    For memory snapshots use ``memory compare`` instead — different format,
-    different tool.
+    Memory snapshots (``peak_mib`` key) are auto-detected and diffed with a
+    peak-RSS table; timing snapshots go through pytest-benchmark. The two
+    can't be mixed in one call.
 
     Implementation note: typer/click don't have a clean idiom for "list-typed
     positional + pass-through", so this command parses ``ctx.args`` by hand
@@ -61,6 +62,32 @@ def compare(ctx: typer.Context) -> None:
     if missing:
         _suggest_snapshots(f"missing snapshots: {[str(p) for p in missing]}")
         raise typer.Exit(code=2)
+
+    # Auto-detect the metric from the snapshots (memory snapshots carry a
+    # ``peak_mib`` key; timing ones don't) and route accordingly — no
+    # ``memory compare`` needed.
+    import json
+
+    is_memory = ["peak_mib" in json.loads(p.read_text()) for p in snapshots]
+    if any(is_memory):
+        if not all(is_memory):
+            typer.secho(
+                "can't compare memory and timing snapshots together",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        if len(snapshots) != 2:
+            typer.secho(
+                "memory compare takes exactly 2 snapshots",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        from benchmarks.memory import compare_snapshots
+
+        compare_snapshots(snapshots[0], snapshots[1])
+        return
 
     # Override pytest-benchmark's wide default table: ``--group-by=fullname``
     # gives each test its own (baseline, candidate) mini-table and

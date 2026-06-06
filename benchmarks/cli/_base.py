@@ -11,11 +11,26 @@ a TTY, so piping any command into ``grep`` still yields plain text.
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Literal
 
 import typer
 
 from benchmarks.snapshot import discover_snapshots
+
+
+class Measure(StrEnum):
+    """
+    What a measuring command records — orthogonal to the workflow.
+
+    ``time`` runs pytest-benchmark (wall clock); ``memory`` tracks peak RSS
+    via memray; ``both`` runs them sequentially (never concurrently — memray's
+    overhead would skew the wall-clock numbers).
+    """
+
+    time = "time"
+    memory = "memory"
+    both = "both"
 
 app = typer.Typer(
     help=(
