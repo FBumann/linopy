@@ -251,20 +251,28 @@ def _measurements(
 
 
 def run_phase(
-    phase: str, quick: bool = False, repeats: int = 1, filter_expr: str | None = None
+    phase: str,
+    quick: bool = False,
+    repeats: int = 1,
+    filter_expr: str | None = None,
+    long: bool = False,
+    sizes: tuple[int, ...] = (),
+    severities: tuple[int, ...] = (),
 ) -> dict[str, float]:
     """
     Measure peak memory for every applicable ``(spec, size)`` under one phase.
 
     Returns a ``{test_id: peak_mib}`` mapping. Invoked once per phase as a
-    subprocess by :func:`save` for isolation. ``repeats`` is forwarded to
+    subprocess by :func:`measure` for isolation. ``repeats`` is forwarded to
     :func:`measure_peak` so callers can dial up signal-to-noise. ``filter_expr``
     keeps only specs whose ``<name>-<axis>=<value>`` key contains it — e.g.
     ``"nodal_balance"`` (one spec), ``"severity"`` (patterns), ``"n="`` (models).
+    Size selection (``quick`` / ``long`` / ``sizes`` / ``severities``) shares
+    :func:`benchmarks.registry.skip_reason` with pytest so the two never drift.
     """
     _require_memray()
 
-    from benchmarks.registry import all_specs
+    from benchmarks.registry import all_specs, skip_reason
 
     tag = _phase_tag(phase)
     results: dict[str, float] = {}
@@ -281,7 +289,14 @@ def run_phase(
                 break
         else:
             for value in spec.sweep:
-                if quick and value not in spec.quick_subset:
+                if skip_reason(
+                    spec,
+                    value,
+                    quick=quick,
+                    long=long,
+                    sizes=sizes,
+                    severities=severities,
+                ):
                     continue
                 key = spec_param_id(spec.name, spec.axis, value)
                 if filter_expr and filter_expr not in key:
@@ -310,21 +325,24 @@ def run_phase(
     return results
 
 
-def save(
-    label: str,
+def measure(
     quick: bool = False,
     phases: list[str] | None = None,
     repeats: int = 1,
     filter_expr: str | None = None,
-) -> Path:
+    long: bool = False,
+    sizes: tuple[int, ...] = (),
+    severities: tuple[int, ...] = (),
+) -> dict[str, float]:
     """
-    Run one subprocess per phase and merge the results into ``<label>.json``.
+    Run one subprocess per phase and return merged ``{test_id: peak_mib}``.
 
     Per-phase subprocesses keep allocations from one phase out of another's
     measurement; ``memray.Tracker`` only counts what's allocated inside its
     ``with`` block, but the subprocess boundary makes the isolation total.
     ``filter_expr`` restricts which specs are measured (substring of the
-    ``<name>-<axis>=<value>`` key).
+    ``<name>-<axis>=<value>`` key); ``quick``/``long``/``sizes``/``severities``
+    select sizes the same way pytest does.
     """
     _require_memray()
 
@@ -351,6 +369,12 @@ def save(
         ]
         if quick:
             cmd.append("--quick")
+        if long:
+            cmd.append("--long")
+        for s in sizes:
+            cmd.extend(["--size", str(s)])
+        for s in severities:
+            cmd.extend(["--severity", str(s)])
         if repeats > 1:
             cmd.extend(["--repeats", str(repeats)])
         if filter_expr:
@@ -374,13 +398,35 @@ def save(
         finally:
             Path(out_tmp).unlink(missing_ok=True)
 
-    if not all_results:
+    return all_results
+
+
+def save(
+    label: str,
+    quick: bool = False,
+    phases: list[str] | None = None,
+    repeats: int = 1,
+    filter_expr: str | None = None,
+    long: bool = False,
+    sizes: tuple[int, ...] = (),
+    severities: tuple[int, ...] = (),
+) -> Path:
+    """Measure peak memory and write a snapshot to ``RESULTS_DIR/<label>.json``."""
+    results = measure(
+        quick=quick,
+        phases=phases,
+        repeats=repeats,
+        filter_expr=filter_expr,
+        long=long,
+        sizes=sizes,
+        severities=severities,
+    )
+    if not results:
         print("No measurements produced.", file=sys.stderr)
         sys.exit(1)
-
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = write_memory_snapshot(RESULTS_DIR / f"{label}.json", label, all_results)
-    print(f"\nSaved {len(all_results)} measurements to {out_path}", file=sys.stderr)
+    out_path = write_memory_snapshot(RESULTS_DIR / f"{label}.json", label, results)
+    print(f"\nSaved {len(results)} measurements to {out_path}", file=sys.stderr)
     return out_path
 
 
@@ -429,6 +475,11 @@ if __name__ == "__main__":  # pragma: no cover
     parser.add_argument("cmd", choices=["_worker"])
     parser.add_argument("phase")
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--long", action="store_true")
+    parser.add_argument("--size", action="append", type=int, default=[], dest="sizes")
+    parser.add_argument(
+        "--severity", action="append", type=int, default=[], dest="severities"
+    )
     parser.add_argument(
         "--repeats",
         type=int,
@@ -453,5 +504,8 @@ if __name__ == "__main__":  # pragma: no cover
             quick=args.quick,
             repeats=args.repeats,
             filter_expr=args.filter_expr,
+            long=args.long,
+            sizes=tuple(args.sizes),
+            severities=tuple(args.severities),
         )
         Path(args.out).write_text(json.dumps(out))

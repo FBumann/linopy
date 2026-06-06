@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from benchmarks.registry import BenchSpec
+from benchmarks.registry import BenchSpec, skip_reason
 
 # Test modules the CodSpeed instruments measure (edit to change coverage).
 # build + the two export paths: to_lp (LP text) and to_solver (direct handoff,
@@ -95,23 +95,13 @@ def maybe_skip(request: pytest.FixtureRequest, spec: BenchSpec, size: int) -> No
     for mod in spec.requires:
         pytest.importorskip(mod)
 
-    # Manual axis selection (e.g. from CI): --size for models, --severity for
-    # patterns. Empty list ⇒ not requested, fall through to the tier flags.
-    flag = "--severity" if spec.axis == "severity" else "--size"
-    manual = request.config.getoption(flag)
-    if manual:
-        if size not in manual:
-            pytest.skip(f"{flag}: {spec.name} {spec.axis}={size} not selected")
-        return
-
-    quick = request.config.getoption("--quick")
-    long_ = request.config.getoption("--long")
-
-    if quick:
-        if size not in spec.quick_subset:
-            pytest.skip(f"--quick: skipping {spec.name} {spec.axis}={size}")
-    elif not long_:
-        if size > spec.long_threshold:
-            pytest.skip(
-                f"long sweep needs --long: skipping {spec.name} {spec.axis}={size}"
-            )
+    reason = skip_reason(
+        spec,
+        size,
+        quick=request.config.getoption("--quick"),
+        long=request.config.getoption("--long"),
+        sizes=tuple(request.config.getoption("--size")),
+        severities=tuple(request.config.getoption("--severity")),
+    )
+    if reason:
+        pytest.skip(reason)

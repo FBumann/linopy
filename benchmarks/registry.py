@@ -382,3 +382,37 @@ def get_pattern(name: str) -> PatternSpec:
 def all_specs() -> list[BenchSpec]:
     """Every spec in the suite — models then patterns."""
     return [*REGISTRY.values(), *PATTERNS.values()]
+
+
+def skip_reason(
+    spec: BenchSpec,
+    value: int,
+    *,
+    quick: bool = False,
+    long: bool = False,
+    sizes: tuple[int, ...] = (),
+    severities: tuple[int, ...] = (),
+) -> str | None:
+    """
+    Why ``(spec, value)`` is excluded under this selection, or ``None`` to run.
+
+    Single source of truth for size/severity selection, shared by pytest
+    (``conftest.maybe_skip``) and the memory engine (``memory.run_phase``) so
+    the two can't drift. Precedence, most specific first:
+
+    - a manual axis list (``sizes`` for models, ``severities`` for patterns)
+      → run only those values;
+    - ``--quick`` → only ``spec.quick_subset``;
+    - default → skip ``value > long_threshold``;
+    - ``--long`` → no cap.
+    """
+    manual = severities if spec.axis == "severity" else sizes
+    if manual:
+        return None if value in manual else f"{spec.axis}={value} not selected"
+    if quick:
+        if value not in spec.quick_subset:
+            return f"--quick: skipping {spec.name} {spec.axis}={value}"
+        return None
+    if not long and value > spec.long_threshold:
+        return f"long sweep needs --long: skipping {spec.name} {spec.axis}={value}"
+    return None

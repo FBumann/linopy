@@ -16,11 +16,11 @@ from benchmarks.cli._base import _suggest_snapshots, app
 )
 def compare(ctx: typer.Context) -> None:
     """
-    Compare timing snapshots side-by-side via ``pytest-benchmark compare``.
+    Compare two snapshots side-by-side — timing or memory, auto-detected.
 
-    Thin wrapper around the upstream tool so the whole suite stays under
-    one entry point. Pass the snapshot paths first, then any pytest-benchmark
-    flags::
+    Timing snapshots wrap ``pytest-benchmark compare``; memory snapshots
+    (``peak_mib`` key) get a peak-RSS table. Pass the snapshot paths first,
+    then any pytest-benchmark flags (timing only)::
 
         python -m benchmarks compare a.json b.json
         python -m benchmarks compare a.json b.json --group-by=name

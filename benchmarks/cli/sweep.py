@@ -176,6 +176,7 @@ def sweep(
             versions,
             output_dir=out,
             quick=quick,
+            long=long,
             phases=[phase] if phase is not None else None,
             repeats=repeats,
             as_of=as_of,
