@@ -137,14 +137,8 @@ class ModelSpec:
     @property
     def quick_subset(self) -> tuple[int, ...]:
         """
-        Sizes that run under ``--quick`` — the two *smaller* of first/mid/last.
-
-        The largest size is dropped from the per-PR set: memory tracking is
-        deterministic, so small/mid already catch a model's regressions, and the
-        giant (e.g. basic n=1600 ≈ 550 MiB) just inflates CI time without adding
-        detection — the patterns carry the representative memory load. The full
-        range still runs by default / under ``--long`` / in the sweep.
-        ``quick_sizes`` overrides this (``()`` opts out entirely).
+        ``--quick`` sizes — first/mid (drops the giant largest to keep CI
+        cheap). ``quick_sizes`` overrides; ``()`` opts out.
         """
         if self.quick_sizes is not None:
             return self.quick_sizes
