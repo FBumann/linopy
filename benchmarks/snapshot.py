@@ -1,24 +1,20 @@
 """
-The benchmark snapshot contract — one owner for the on-disk JSON shapes,
-the test-id grammar, and the long-DataFrame loader.
+The benchmark snapshot contract — one owner for the on-disk JSON shapes, the
+test-id grammar, and the long-DataFrame loader.
 
-Dependency-free within the package (stdlib plus a lazily-imported
-pandas), so every writer (pytest-benchmark via file, :func:`memory.save`,
-:mod:`benchmarks.bench`) and every reader (:mod:`benchmarks.plotting`,
-:func:`memory.compare`) can sit on it without import cycles.
+Dependency-free (stdlib + lazy pandas) so every writer (pytest-benchmark,
+:func:`memory.save`, :mod:`benchmarks.bench`) and reader
+(:mod:`benchmarks.plotting`, :func:`memory.compare`) shares it without cycles.
 
-Two snapshot shapes, auto-detected on load:
+Two shapes, auto-detected on load:
 
-- **timing** — ``{"benchmarks": [{"fullname": <id>, "stats": {"min":…,
-  "median":…, "mean":…, "max":…}}]}`` → value in **seconds** (the shape
-  pytest-benchmark writes).
-- **memory** — ``{"label": <str>, "peak_mib": {<id>: <float>}}`` → value
-  in **MiB**.
+- **timing** — ``{"benchmarks": [{"fullname": <id>, "stats": {…}}]}`` → seconds
+  (what pytest-benchmark writes).
+- **memory** — ``{"label": <str>, "peak_mib": {<id>: <float>}}`` → MiB.
 
-Test ids follow ``…[<spec>-<axis>=<value>]`` where ``<axis>`` is the sweep
-dial — ``n`` for a model (size) or ``severity`` for a pattern — and ``<value>``
-is the integer swept. :func:`parse_test_id` splits one into
-``(phase, spec, value, axis)`` and :func:`synth_test_id` builds one.
+Test ids are ``…[<spec>-<axis>=<value>]`` where ``<axis>`` is the sweep dial
+(``n`` for size, ``severity`` for a pattern). :func:`parse_test_id` splits one;
+:func:`synth_test_id` builds one.
 """
 
 from __future__ import annotations
@@ -138,9 +134,17 @@ def load_snapshot(
     - memory (``{"peak_mib": {id: float}}``) → ``value`` is the peak in
       **MiB**; ``metric`` is ignored.
     """
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path}: not a readable JSON snapshot ({exc})") from exc
     if "peak_mib" in data:
         return path.stem, dict(data["peak_mib"]), "MiB"
+    if "benchmarks" not in data:
+        raise ValueError(
+            f"{path}: unrecognized snapshot shape "
+            "(no 'peak_mib' memory key or 'benchmarks' timing key)"
+        )
     values = {bm["fullname"]: bm["stats"][metric] for bm in data["benchmarks"]}
     return path.stem, values, "s"
 
